@@ -1,0 +1,32 @@
+[project]
+name = "credit-union-mcp"
+version = "1.0.0"
+description = "Multi-Agentic Credit Union Analytics MCP Server"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "pyodbc>=5.0.0",
+    "SQLAlchemy>=2.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.3.0",
+    "pydantic>=2.0.0",
+    "PyYAML>=6.0",
+    "loguru>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "black>=23.0.0", "mypy>=1.5.0"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true

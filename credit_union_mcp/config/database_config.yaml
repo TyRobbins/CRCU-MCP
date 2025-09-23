@@ -1,0 +1,21 @@
+TEMENOS:
+  server: "decsql4"
+  port: 1433
+  database: "Temenos"
+  windows_auth: false
+  username: "svctrcacct"
+  password: "e;Co_Bb2MD_Pbvh%f"
+  
+ARCUSYM000:
+  server: "prodarcu"
+  port: 1433
+  database: "ARCUSYM000"
+  windows_auth: false
+  username: "svctrcacct"
+  password: "e;Co_Bb2MD_Pbvh%f"
+
+connection_pool:
+  pool_size: 5
+  max_overflow: 10
+  pool_timeout: 30
+  pool_recycle: 3600
