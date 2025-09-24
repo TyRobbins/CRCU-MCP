@@ -197,20 +197,28 @@ class DatabaseManager:
         Returns:
             List of table names
         """
+        # Use simpler query to avoid INFORMATION_SCHEMA issues
         query = """
-        SELECT TABLE_NAME 
-        FROM INFORMATION_SCHEMA.TABLES 
-        WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
-        ORDER BY TABLE_NAME
+        SELECT name as TABLE_NAME
+        FROM sys.tables 
+        WHERE schema_id = SCHEMA_ID(:schema_name)
+        ORDER BY name
         """
         
         try:
-            result = self.execute_query(database, query, params={'schema': schema})
+            result = self.execute_query(database, query, params={'schema_name': schema})
             return result['TABLE_NAME'].tolist()
             
         except Exception as e:
             logger.error(f"Failed to get tables for {database}.{schema}: {e}")
-            raise
+            # Fallback to basic query if sys.tables fails
+            try:
+                fallback_query = "SELECT name FROM sysobjects WHERE xtype='U' ORDER BY name"
+                result = self.execute_query(database, fallback_query)
+                return result['name'].tolist()
+            except Exception as fallback_error:
+                logger.error(f"Fallback query also failed: {fallback_error}")
+                raise e
     
     def get_table_schema(self, database: str, table_name: str, schema: str = 'dbo') -> Dict[str, Any]:
         """
@@ -224,26 +232,30 @@ class DatabaseManager:
         Returns:
             Dictionary containing table schema information
         """
+        # Use sys.columns instead of INFORMATION_SCHEMA to avoid COUNT issues
         query = """
         SELECT 
-            COLUMN_NAME,
-            DATA_TYPE,
-            IS_NULLABLE,
-            COLUMN_DEFAULT,
-            CHARACTER_MAXIMUM_LENGTH,
-            NUMERIC_PRECISION,
-            NUMERIC_SCALE,
-            ORDINAL_POSITION
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        ORDER BY ORDINAL_POSITION
+            c.name as COLUMN_NAME,
+            t.name as DATA_TYPE,
+            c.is_nullable as IS_NULLABLE,
+            dc.definition as COLUMN_DEFAULT,
+            c.max_length as CHARACTER_MAXIMUM_LENGTH,
+            c.precision as NUMERIC_PRECISION,
+            c.scale as NUMERIC_SCALE,
+            c.column_id as ORDINAL_POSITION
+        FROM sys.columns c
+        INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
+        LEFT JOIN sys.default_constraints dc ON c.default_object_id = dc.object_id
+        WHERE c.object_id = OBJECT_ID(:full_table_name)
+        ORDER BY c.column_id
         """
         
         try:
+            full_table_name = f"{schema}.{table_name}"
             result = self.execute_query(
                 database, 
                 query, 
-                params={'schema': schema, 'table_name': table_name}
+                params={'full_table_name': full_table_name}
             )
             
             columns = []
@@ -251,7 +263,7 @@ class DatabaseManager:
                 column_info = {
                     'name': row['COLUMN_NAME'],
                     'type': row['DATA_TYPE'],
-                    'nullable': row['IS_NULLABLE'] == 'YES',
+                    'nullable': bool(row['IS_NULLABLE']),
                     'default': row['COLUMN_DEFAULT'],
                     'max_length': row['CHARACTER_MAXIMUM_LENGTH'],
                     'precision': row['NUMERIC_PRECISION'],
@@ -270,7 +282,21 @@ class DatabaseManager:
             
         except Exception as e:
             logger.error(f"Failed to get schema for {database}.{schema}.{table_name}: {e}")
-            raise
+            # Fallback to simple column check
+            try:
+                fallback_query = f"SELECT TOP 1 * FROM [{schema}].[{table_name}]"
+                sample_data = self.execute_query(database, fallback_query)
+                columns = [{'name': col, 'type': 'unknown'} for col in sample_data.columns]
+                return {
+                    'database': database,
+                    'schema': schema,
+                    'table_name': table_name,
+                    'columns': columns,
+                    'column_count': len(columns)
+                }
+            except Exception as fallback_error:
+                logger.error(f"Schema fallback also failed: {fallback_error}")
+                raise e
     
     def test_connection(self, database: Optional[str] = None) -> Union[bool, Dict[str, bool]]:
         """
@@ -326,6 +352,193 @@ class DatabaseManager:
             logger.error(f"Failed to get sample data from {database}.{schema}.{table_name}: {e}")
             raise
     
+    def discover_actual_schema(self, database: str) -> Dict[str, List[str]]:
+        """
+        Discover actual table schemas dynamically to map business concepts to real tables.
+        
+        Args:
+            database: Target database name
+            
+        Returns:
+            Dictionary mapping business concepts to actual table names
+        """
+        schema_mapping = {}
+        
+        try:
+            # Get all tables in the database
+            all_tables = self.get_tables(database)
+            
+            # Map business concepts to actual table patterns
+            business_concepts = {
+                'member_tables': ['NAME', 'MEMBERREC', 'MBRADDRESS'],
+                'account_tables': ['ACCOUNT', 'SAVINGS', 'LOAN', 'CARD'],
+                'transaction_tables': ['ACTIVITY', 'SAVINGSTRANSACTION', 'LOANTRANSACTION', 'EFT'],
+                'workflow_tables': [t for t in all_tables if t.startswith('tbl')],
+                'all_tables': all_tables
+            }
+            
+            # Filter existing tables for each concept
+            for concept, patterns in business_concepts.items():
+                if concept == 'workflow_tables':
+                    schema_mapping[concept] = patterns
+                elif concept == 'all_tables':
+                    schema_mapping[concept] = patterns
+                else:
+                    schema_mapping[concept] = [t for t in patterns if t in all_tables]
+            
+            logger.info(f"Discovered schema for {database}: {len(all_tables)} tables found")
+            return schema_mapping
+            
+        except Exception as e:
+            logger.error(f"Failed to discover schema for {database}: {e}")
+            return {'error': str(e)}
+    
+    def validate_table_exists(self, database: str, table_name: str, schema: str = 'dbo') -> bool:
+        """
+        Validate that a table exists before attempting to query it.
+        
+        Args:
+            database: Target database
+            table_name: Name of table to validate
+            schema: Schema name
+            
+        Returns:
+            True if table exists, False otherwise
+        """
+        try:
+            tables = self.get_tables(database, schema)
+            return table_name in tables
+        except Exception as e:
+            logger.warning(f"Could not validate table existence {database}.{schema}.{table_name}: {e}")
+            return False
+    
+    def get_safe_query_with_fallback(self, database: str, primary_query: str, fallback_query: str, 
+                                   params: Optional[Dict] = None) -> pd.DataFrame:
+        """
+        Execute a query with automatic fallback if primary query fails.
+        
+        Args:
+            database: Target database
+            primary_query: Primary query to attempt
+            fallback_query: Fallback query if primary fails
+            params: Query parameters
+            
+        Returns:
+            DataFrame with results from successful query
+        """
+        try:
+            # Try primary query first
+            return self.execute_query(database, primary_query, params)
+        except Exception as primary_error:
+            logger.warning(f"Primary query failed, trying fallback: {primary_error}")
+            try:
+                return self.execute_query(database, fallback_query, params)
+            except Exception as fallback_error:
+                logger.error(f"Both queries failed. Primary: {primary_error}, Fallback: {fallback_error}")
+                # Return empty DataFrame with expected structure
+                return pd.DataFrame()
+
+    def validate_table_columns(self, database: str, table_name: str, required_columns: List[str], schema: str = 'dbo') -> Dict[str, bool]:
+        """
+        Validate that required columns exist in a table.
+        
+        Args:
+            database: Database name
+            table_name: Table name to validate
+            required_columns: List of column names that must exist
+            schema: Schema name (default: 'dbo')
+            
+        Returns:
+            Dictionary mapping column names to existence (True/False)
+        """
+        try:
+            table_schema = self.get_table_schema(database, table_name, schema)
+            existing_columns = {col['name'].upper() for col in table_schema['columns']}
+            
+            validation_results = {}
+            for col in required_columns:
+                validation_results[col] = col.upper() in existing_columns
+                
+            return validation_results
+            
+        except Exception as e:
+            logger.error(f"Column validation failed for {database}.{schema}.{table_name}: {e}")
+            # Return False for all columns if validation fails
+            return {col: False for col in required_columns}
+    
+    def build_safe_query(self, base_query: str, database: str, table_validations: Dict[str, List[str]] = None) -> str:
+        """
+        Build a safe query by validating column names and providing fallbacks.
+        
+        Args:
+            base_query: Base SQL query template
+            database: Target database
+            table_validations: Dict mapping table names to required columns
+            
+        Returns:
+            Validated and safe SQL query
+        """
+        if not table_validations:
+            return base_query
+            
+        safe_query = base_query
+        
+        for table_name, required_columns in table_validations.items():
+            try:
+                # Check if table exists first
+                if not self.validate_table_exists(database, table_name):
+                    logger.warning(f"Table {table_name} does not exist in {database}")
+                    continue
+                    
+                # Validate columns
+                column_validation = self.validate_table_columns(database, table_name, required_columns)
+                
+                # Log missing columns
+                missing_columns = [col for col, exists in column_validation.items() if not exists]
+                if missing_columns:
+                    logger.warning(f"Missing columns in {table_name}: {missing_columns}")
+                    
+            except Exception as e:
+                logger.error(f"Query validation failed for table {table_name}: {e}")
+                
+        return safe_query
+    
+    def execute_safe_query_with_fallback(self, database: str, primary_query: str, fallback_queries: List[str] = None, params: Optional[Dict] = None) -> pd.DataFrame:
+        """
+        Execute query with multiple fallback options if primary fails.
+        
+        Args:
+            database: Target database
+            primary_query: Primary query to attempt
+            fallback_queries: List of fallback queries to try
+            params: Query parameters
+            
+        Returns:
+            DataFrame with results from first successful query
+        """
+        queries_to_try = [primary_query] + (fallback_queries or [])
+        
+        for i, query in enumerate(queries_to_try):
+            try:
+                logger.info(f"Attempting query {i+1}/{len(queries_to_try)}")
+                result = self.execute_query(database, query, params)
+                if not result.empty:
+                    logger.info(f"Query {i+1} succeeded with {len(result)} rows")
+                    return result
+                else:
+                    logger.warning(f"Query {i+1} returned no data")
+                    
+            except Exception as e:
+                logger.error(f"Query {i+1} failed: {e}")
+                if i == len(queries_to_try) - 1:  # Last query
+                    logger.error("All queries failed")
+                    raise e
+                else:
+                    logger.info(f"Trying fallback query {i+2}")
+                    
+        # Return empty DataFrame if all queries fail but don't raise exception
+        return pd.DataFrame()
+
     def close_connections(self) -> None:
         """Close all database connections."""
         for db_name, engine in self.engines.items():

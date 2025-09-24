@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "credit-union-analytics": {
+      "command": "python",
+      "args": ["C:/Users/Ty.Cinchy/Documents/GitHub/CRCU-MCP/credit_union_mcp/src/main.py"],
+      "cwd": "C:/Users/Ty.Cinchy/Documents/GitHub/CRCU-MCP/credit_union_mcp"
+    }
+  }
+}

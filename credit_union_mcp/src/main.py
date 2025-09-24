@@ -18,9 +18,16 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from loguru import logger
 
-from .database.connection import DatabaseManager
-from .orchestration.coordinator import AgentCoordinator
-from .agents.base_agent import AnalysisContext
+import sys
+import os
+# Add the project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+from src.database.connection import DatabaseManager
+from src.database.data_catalog import DataCatalog
+from src.orchestration.coordinator import AgentCoordinator
+from src.agents.base_agent import AnalysisContext
 
 
 class CreditUnionMCP:
@@ -63,44 +70,109 @@ class CreditUnionMCP:
     async def setup(self):
         """Initialize database connections and agents."""
         try:
-            # Load database configuration
-            config_path = Path("config/database_config.yaml")
+            print("Starting MCP server setup...", file=sys.stderr)
+            
+            # Load database configuration (relative to project root, not src/)
+            project_root = Path(__file__).parent.parent
+            config_path = project_root / "config" / "database_config.yaml"
+            print(f"Looking for config at: {config_path}", file=sys.stderr)
+            
             if not config_path.exists():
-                raise FileNotFoundError(f"Database configuration not found: {config_path}")
-            
-            with open(config_path, 'r') as f:
-                db_config = yaml.safe_load(f)
-            
-            # Initialize database manager
-            self.db_manager = DatabaseManager(db_config)
-            logger.info("Database manager initialized")
-            
-            # Test database connections
-            for db_name in ['TEMENOS', 'ARCUSYM000']:
-                if db_name in db_config:
-                    try:
-                        connection_status = self.db_manager.test_connection(db_name)
-                        if connection_status:
-                            logger.info(f"Successfully connected to {db_name} database")
-                        else:
-                            logger.warning(f"Failed to connect to {db_name} database")
-                    except Exception as e:
-                        logger.error(f"Error testing {db_name} connection: {e}")
-            
-            # Initialize agent coordinator
-            self.coordinator = AgentCoordinator(self.db_manager)
-            logger.info("Agent coordinator initialized")
+                print(f"Warning: Database configuration not found at {config_path}", file=sys.stderr)
+                print("Running in demo mode without database connectivity", file=sys.stderr)
+                self.db_manager = None
+                self.coordinator = None
+            else:
+                with open(config_path, 'r') as f:
+                    db_config = yaml.safe_load(f)
+                print("Database config loaded successfully", file=sys.stderr)
+                
+                try:
+                    # Initialize database manager
+                    self.db_manager = DatabaseManager(db_config)
+                    print("Database manager initialized", file=sys.stderr)
+                    logger.info("Database manager initialized")
+                    
+                    # Test database connections (but don't fail if they don't work)
+                    for db_name in ['TEMENOS', 'ARCUSYM000']:
+                        if db_name in db_config:
+                            try:
+                                connection_status = self.db_manager.test_connection(db_name)
+                                if connection_status:
+                                    print(f"Successfully connected to {db_name} database", file=sys.stderr)
+                                    logger.info(f"Successfully connected to {db_name} database")
+                                else:
+                                    print(f"Failed to connect to {db_name} database", file=sys.stderr)
+                                    logger.warning(f"Failed to connect to {db_name} database")
+                            except Exception as e:
+                                print(f"Error testing {db_name} connection: {e}", file=sys.stderr)
+                                logger.error(f"Error testing {db_name} connection: {e}")
+                    
+                    # Initialize agent coordinator
+                    self.coordinator = AgentCoordinator(self.db_manager)
+                    print("Agent coordinator initialized", file=sys.stderr)
+                    logger.info("Agent coordinator initialized")
+                    
+                except Exception as db_error:
+                    print(f"Database initialization failed: {db_error}", file=sys.stderr)
+                    logger.error(f"Database initialization failed: {db_error}")
+                    # Continue without database connectivity
+                    self.coordinator = None
+                    print("Running in limited mode without database connectivity", file=sys.stderr)
             
             # Register MCP tools
             self._register_tools()
+            print("MCP tools registered successfully", file=sys.stderr)
             logger.info("MCP tools registered")
             
         except Exception as e:
+            print(f"Failed to setup MCP server: {e}", file=sys.stderr)
             logger.error(f"Failed to setup MCP server: {e}")
             raise
     
     def _register_tools(self):
         """Register all MCP tools."""
+        
+        @self.server.list_resources()
+        async def list_resources():
+            """List available resources."""
+            return [
+                {
+                    "uri": "database://connection",
+                    "name": "Database Connection Info",
+                    "description": "Current database connection configuration",
+                    "mimeType": "application/json"
+                }
+            ]
+        
+        @self.server.read_resource()
+        async def read_resource(uri: str):
+            """Read a specific resource."""
+            if uri == "database://connection":
+                return {
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({
+                                "databases": list(self.db_manager.engines.keys()) if self.db_manager else [],
+                                "status": "connected" if self.db_manager else "disconnected",
+                                "available_agents": len(self.coordinator.agents) if self.coordinator else 0
+                            }, indent=2)
+                        }
+                    ]
+                }
+            else:
+                raise ValueError(f"Unknown resource: {uri}")
+        
+        @self.server.list_prompts()
+        async def list_prompts():
+            """List available prompts."""
+            return []
+        
+        @self.server.get_prompt()
+        async def get_prompt(name: str, arguments: Optional[Dict[str, str]] = None):
+            """Get a specific prompt."""
+            raise ValueError(f"Unknown prompt: {name}")
         
         @self.server.list_tools()
         async def list_tools() -> List[Tool]:
@@ -116,7 +188,7 @@ class CreditUnionMCP:
                             "database": {
                                 "type": "string",
                                 "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "default": "ARCUSYM000",
                                 "description": "Target database (TEMENOS or ARCUSYM000)"
                             },
                             "query": {
@@ -141,8 +213,8 @@ class CreditUnionMCP:
                             "database": {
                                 "type": "string",
                                 "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
-                                "description": "Target database"
+                                "default": "ARCUSYM000",
+                                "description": "Target database (ARCUSYM000 primary, TEMENOS for specialized workflows)"
                             },
                             "schema": {
                                 "type": "string",
@@ -161,7 +233,7 @@ class CreditUnionMCP:
                             "database": {
                                 "type": "string",
                                 "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "default": "ARCUSYM000",
                                 "description": "Target database"
                             },
                             "table_name": {
@@ -188,13 +260,13 @@ class CreditUnionMCP:
                             "database": {
                                 "type": "string",
                                 "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "default": "ARCUSYM000",
                                 "description": "Target database"
                             },
                             "metric_type": {
                                 "type": "string",
-                                "enum": ["profitability", "capital", "asset_quality", "comprehensive"],
-                                "default": "comprehensive",
+                                "enum": ["profitability", "capital", "asset_quality"],
+                                "default": "profitability",
                                 "description": "Type of financial metrics to analyze"
                             },
                             "as_of_date": {
@@ -213,13 +285,13 @@ class CreditUnionMCP:
                             "database": {
                                 "type": "string",
                                 "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "default": "ARCUSYM000",
                                 "description": "Target database"
                             },
                             "analysis_type": {
                                 "type": "string",
-                                "enum": ["concentration", "delinquency", "stress_test", "comprehensive"],
-                                "default": "comprehensive",
+                                "enum": ["concentration", "delinquency", "stress_test"],
+                                "default": "concentration",
                                 "description": "Type of risk analysis to perform"
                             },
                             "as_of_date": {
@@ -237,19 +309,43 @@ class CreditUnionMCP:
                         "properties": {
                             "database": {
                                 "type": "string",
-                                "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
-                                "description": "Target database"
+                                "enum": ["ARCUSYM000"],
+                                "default": "ARCUSYM000",
+                                "description": "Target database (ARCUSYM000 for member data)"
                             },
                             "method": {
                                 "type": "string",
-                                "enum": ["rfm", "clustering", "lifetime_value", "churn_prediction", "comprehensive"],
-                                "default": "comprehensive",
+                                "enum": ["rfm", "clustering", "lifetime_value", "churn_prediction", "active_members"],
+                                "default": "active_members",
                                 "description": "Analysis method to use"
                             },
                             "as_of_date": {
                                 "type": "string",
                                 "description": "Analysis date (YYYY-MM-DD format)"
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="get_active_members",
+                    description="Get current active members using CRCU business rules with PII protection",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "database": {
+                                "type": "string",
+                                "enum": ["ARCUSYM000"],
+                                "default": "ARCUSYM000",
+                                "description": "Target database (ARCUSYM000 for CRCU active members query)"
+                            },
+                            "as_of_date": {
+                                "type": "string",
+                                "description": "Analysis date (YYYY-MM-DD format). Defaults to current date if not provided"
+                            },
+                            "include_insights": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": "Include analysis insights and recommendations"
                             }
                         }
                     }
@@ -262,14 +358,14 @@ class CreditUnionMCP:
                         "properties": {
                             "database": {
                                 "type": "string",
-                                "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "enum": ["ARCUSYM000"],
+                                "default": "ARCUSYM000",
                                 "description": "Target database"
                             },
                             "check_type": {
                                 "type": "string",
-                                "enum": ["capital", "bsa_aml", "lending_limits", "cecl", "all"],
-                                "default": "all",
+                                "enum": ["capital", "bsa_aml", "lending_limits"],
+                                "default": "capital",
                                 "description": "Type of compliance check to perform"
                             },
                             "as_of_date": {
@@ -287,14 +383,14 @@ class CreditUnionMCP:
                         "properties": {
                             "database": {
                                 "type": "string",
-                                "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "enum": ["ARCUSYM000"],
+                                "default": "ARCUSYM000",
                                 "description": "Target database"
                             },
                             "focus_area": {
                                 "type": "string",
-                                "enum": ["branch", "channel", "staff", "all"],
-                                "default": "all",
+                                "enum": ["branch", "channel", "staff"],
+                                "default": "branch",
                                 "description": "Operational area to focus on"
                             },
                             "as_of_date": {
@@ -314,8 +410,8 @@ class CreditUnionMCP:
                         "properties": {
                             "database": {
                                 "type": "string",
-                                "enum": ["TEMENOS", "ARCUSYM000"],
-                                "default": "TEMENOS",
+                                "enum": ["ARCUSYM000"],
+                                "default": "ARCUSYM000",
                                 "description": "Target database"
                             },
                             "as_of_date": {
@@ -326,7 +422,7 @@ class CreditUnionMCP:
                                 "type": "array",
                                 "items": {
                                     "type": "string",
-                                    "enum": ["financial_performance", "portfolio_risk", "member_analytics", "compliance", "operations"]
+                                    "enum": ["member_analytics", "compliance", "operations"]
                                 },
                                 "description": "Specific agents to run (optional, runs all if not specified)"
                             }
@@ -391,6 +487,8 @@ class CreditUnionMCP:
                     return await self._handle_agent_analysis("portfolio_risk", arguments)
                 elif name == "analyze_member_segments":
                     return await self._handle_agent_analysis("member_analytics", arguments)
+                elif name == "get_active_members":
+                    return await self._handle_active_members_analysis(arguments)
                 elif name == "check_compliance":
                     return await self._handle_agent_analysis("compliance", arguments)
                 elif name == "analyze_operations":
@@ -421,7 +519,16 @@ class CreditUnionMCP:
     
     async def _handle_execute_query(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle SQL query execution."""
-        database = arguments.get('database', 'TEMENOS')
+        if not self.db_manager:
+            return [TextContent(
+                type="text",
+                text=json.dumps({
+                    "error": "Database not available",
+                    "message": "Server running in demo mode without database connectivity"
+                }, indent=2)
+            )]
+        
+        database = arguments.get('database', 'ARCUSYM000')
         query = arguments['query']
         max_rows = arguments.get('max_rows', 10000)
         
@@ -438,7 +545,7 @@ class CreditUnionMCP:
     
     async def _handle_get_tables(self, arguments: Dict[str, Any]) -> List[TextContent]:
         """Handle get tables request."""
-        database = arguments.get('database', 'TEMENOS')
+        database = arguments.get('database', 'ARCUSYM000')
         schema = arguments.get('schema', 'dbo')
         
         tables = self.db_manager.get_tables(database, schema)
@@ -498,6 +605,44 @@ class CreditUnionMCP:
         )
         
         # Execute analysis
+        result = await self.coordinator.route_request(context)
+        
+        # Convert result to JSON
+        result_dict = {
+            'agent': result.agent,
+            'analysis_type': result.analysis_type,
+            'timestamp': result.timestamp,
+            'success': result.success,
+            'data': result.data,
+            'metrics': result.metrics,
+            'warnings': result.warnings,
+            'errors': result.errors,
+            'metadata': result.metadata
+        }
+        
+        return [TextContent(
+            type="text",
+            text=json.dumps(result_dict, indent=2, default=str)
+        )]
+    
+    async def _handle_active_members_analysis(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Handle active members analysis request."""
+        database = arguments.get('database', 'ARCUSYM000')
+        as_of_date = arguments.get('as_of_date')
+        include_insights = arguments.get('include_insights', True)
+        
+        # Create analysis context for active members analysis
+        context = AnalysisContext(
+            agent_type='member_analytics',
+            database=database,
+            as_of_date=as_of_date,
+            parameters={
+                'method': 'active_members',
+                'include_insights': include_insights
+            }
+        )
+        
+        # Execute active members analysis
         result = await self.coordinator.route_request(context)
         
         # Convert result to JSON

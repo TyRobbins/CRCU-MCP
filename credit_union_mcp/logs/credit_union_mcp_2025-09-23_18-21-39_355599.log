@@ -1,0 +1,18 @@
+2025-09-23 18:21:39 | INFO | __main__:_setup_logging:68 | Credit Union MCP Server initializing...
+2025-09-23 18:21:39 | INFO | src.database.connection:_initialize_engines:77 | Initialized engine for TEMENOS database
+2025-09-23 18:21:39 | INFO | src.database.connection:_initialize_engines:77 | Initialized engine for ARCUSYM000 database
+2025-09-23 18:21:39 | INFO | __main__:setup:94 | Database manager initialized
+2025-09-23 18:21:39 | INFO | src.database.connection:test_connection:319 | Connection test successful for TEMENOS
+2025-09-23 18:21:39 | INFO | __main__:setup:103 | Successfully connected to TEMENOS database
+2025-09-23 18:21:39 | INFO | src.database.connection:test_connection:319 | Connection test successful for ARCUSYM000
+2025-09-23 18:21:39 | INFO | __main__:setup:103 | Successfully connected to ARCUSYM000 database
+2025-09-23 18:21:39 | INFO | src.agents.base_agent:__init__:89 | Initialized FinancialPerformanceAgent
+2025-09-23 18:21:39 | INFO | src.agents.base_agent:__init__:89 | Initialized PortfolioRiskAgent
+2025-09-23 18:21:39 | INFO | src.agents.base_agent:__init__:89 | Initialized MemberAnalyticsAgent
+2025-09-23 18:21:39 | INFO | src.agents.base_agent:__init__:89 | Initialized ComplianceAgent
+2025-09-23 18:21:39 | INFO | src.agents.base_agent:__init__:89 | Initialized OperationsAgent
+2025-09-23 18:21:39 | INFO | src.orchestration.coordinator:__init__:54 | Initialized AgentCoordinator with 5 agents
+2025-09-23 18:21:39 | INFO | __main__:setup:114 | Agent coordinator initialized
+2025-09-23 18:21:39 | INFO | __main__:setup:126 | MCP tools registered
+2025-09-23 18:21:39 | INFO | __main__:run:723 | Credit Union MCP Server setup complete
+2025-09-23 18:21:39 | INFO | __main__:run:726 | MCP Server starting...
