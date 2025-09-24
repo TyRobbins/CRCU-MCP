@@ -31,6 +31,7 @@ from src.agents.base_agent import AnalysisContext
 from src.utils.config_manager import get_config_manager, Environment
 from src.utils.monitoring import get_monitoring_manager, start_monitoring, monitor_performance
 from src.utils.performance_utils import get_performance_tracker
+from src.utils.continuity_manager import ContinuityManager
 
 
 class CreditUnionMCP:
@@ -126,6 +127,11 @@ class CreditUnionMCP:
                     self.coordinator = AgentCoordinator(self.db_manager)
                     print("Agent coordinator initialized", file=sys.stderr)
                     logger.info("Agent coordinator initialized")
+                    
+                    # Initialize continuity manager
+                    self.continuity_manager = ContinuityManager(self.coordinator)
+                    print("Continuity manager initialized", file=sys.stderr)
+                    logger.info("Continuity manager initialized")
                     
                 except Exception as db_error:
                     print(f"Database initialization failed: {db_error}", file=sys.stderr)
@@ -482,6 +488,96 @@ class CreditUnionMCP:
                                 "description": "Specific agents to run (optional, runs all if not specified)"
                             }
                         }
+                    }
+                ),
+                
+                # Continuity Management Tools
+                Tool(
+                    name="start_task_tracking",
+                    description="Start tracking a task for continuity management",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Unique task identifier"
+                            },
+                            "user_request": {
+                                "type": "string",
+                                "description": "Original user request"
+                            },
+                            "analysis_context": {
+                                "type": "object",
+                                "description": "Initial analysis context (optional)",
+                                "additionalProperties": True
+                            }
+                        },
+                        "required": ["task_id", "user_request"]
+                    }
+                ),
+                Tool(
+                    name="update_task_progress",
+                    description="Update task progress and check for continuation needs",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task identifier"
+                            },
+                            "additional_context": {
+                                "type": "string",
+                                "description": "Additional context information"
+                            },
+                            "result_summary": {
+                                "type": "object",
+                                "description": "Summary of completed analysis result",
+                                "additionalProperties": True
+                            }
+                        },
+                        "required": ["task_id"]
+                    }
+                ),
+                Tool(
+                    name="check_continuation_needed",
+                    description="Check if a task needs continuation due to context limits",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task identifier to check"
+                            }
+                        },
+                        "required": ["task_id"]
+                    }
+                ),
+                Tool(
+                    name="create_task_continuation",
+                    description="Create continuation prompt for task transfer",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task identifier to continue"
+                            }
+                        },
+                        "required": ["task_id"]
+                    }
+                ),
+                Tool(
+                    name="get_task_status",
+                    description="Get current status of a tracked task",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task identifier"
+                            }
+                        },
+                        "required": ["task_id"]
                     }
                 ),
                 

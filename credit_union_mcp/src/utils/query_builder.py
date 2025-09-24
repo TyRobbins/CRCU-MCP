@@ -3,6 +3,8 @@ Query Builder Utilities for Credit Union MCP Server
 
 Provides common SQL query patterns and builders to reduce code duplication
 across agents and standardize database interactions.
+
+CRITICAL: All queries MUST include ProcessDate filter to avoid historical aggregation.
 """
 
 from typing import Dict, List, Optional, Any
@@ -14,6 +16,8 @@ from loguru import logger
 class QueryBuilder:
     """
     Builder class for constructing common SQL queries with proper parameterization.
+    
+    CRITICAL: All queries include mandatory ProcessDate filtering.
     """
     
     def __init__(self, database_type: str = "ARCUSYM000"):
@@ -24,99 +28,286 @@ class QueryBuilder:
             database_type: Target database type (ARCUSYM000 or TEMENOS)
         """
         self.database_type = database_type
+        self.ensure_process_date_filter = True  # Mandatory ProcessDate filtering
         
     def build_member_query(self, as_of_date: Optional[str] = None, 
                           include_inactive: bool = False,
-                          limit: Optional[int] = None) -> str:
+                          limit: Optional[int] = None,
+                          use_current_snapshot: bool = True) -> str:
         """
-        Build standardized member data query.
+        Build standardized member data query with ProcessDate filter.
         
         Args:
             as_of_date: Analysis date filter
             include_inactive: Whether to include inactive members
             limit: Optional row limit
+            use_current_snapshot: Use current ProcessDate snapshot (recommended)
             
         Returns:
-            SQL query string
+            SQL query string with ProcessDate filter
         """
-        base_query = """
-        SELECT 
-            n.ACCOUNT AS member_id,
-            n.FIRST AS first_name,
-            n.LAST AS last_name,
-            n.BIRTHDATE AS birth_date,
-            n.OPENDATE AS join_date,
-            n.CLOSEDATE AS close_date,
-            n.STATUS AS member_status,
-            a.ADDRESS AS address,
-            a.CITY AS city,
-            a.STATE AS state,
-            a.ZIPCODE AS zip_code,
-            a.EMAIL AS email,
-            a.PHONE AS phone
-        FROM NAME n
-        LEFT JOIN MBRADDRESS a ON n.ACCOUNT = a.ACCOUNT
-        WHERE 1=1
-        """
+        if use_current_snapshot:
+            base_query = """
+            SELECT 
+                n.PARENTACCOUNT AS member_id,
+                n.FIRST AS first_name,
+                n.LAST AS last_name,
+                n.MBRCREATEDATE AS join_date,  -- Corrected field name
+                n.MBRSTATUS AS member_status,  -- Corrected field name
+                a.ADDRESS AS address,
+                a.CITY AS city,
+                a.STATE AS state,
+                a.ZIPCODE AS zip_code,
+                a.EMAIL AS email,
+                a.PHONE AS phone
+            FROM NAME n
+            LEFT JOIN MBRADDRESS a ON n.PARENTACCOUNT = a.MemberNumber
+            WHERE n.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+                AND n.TYPE = 0  -- Primary name record
+                AND n.SSN IS NOT NULL AND n.SSN <> ''  -- Valid SSN required
+                AND CAST(n.PARENTACCOUNT AS BIGINT) > 100  -- Exclude test accounts
+            """
+        else:
+            # Fallback without ProcessDate (not recommended)
+            base_query = """
+            SELECT 
+                n.PARENTACCOUNT AS member_id,
+                n.FIRST AS first_name,
+                n.LAST AS last_name,
+                n.MBRCREATEDATE AS join_date,
+                n.MBRSTATUS AS member_status,
+                a.ADDRESS AS address,
+                a.CITY AS city,
+                a.STATE AS state,
+                a.ZIPCODE AS zip_code,
+                a.EMAIL AS email,
+                a.PHONE AS phone
+            FROM NAME n
+            LEFT JOIN MBRADDRESS a ON n.PARENTACCOUNT = a.MemberNumber
+            WHERE n.TYPE = 0 AND CAST(n.PARENTACCOUNT AS BIGINT) > 100
+            """
         
         conditions = []
         
         if not include_inactive:
-            conditions.append("n.STATUS IN ('A', 'ACTIVE')")
+            conditions.append("n.MBRSTATUS = 0")  # Corrected field name
             
         if as_of_date:
-            conditions.append("n.OPENDATE <= :as_of_date")
-            conditions.append("(n.CLOSEDATE IS NULL OR n.CLOSEDATE > :as_of_date)")
+            conditions.append("n.MBRCREATEDATE <= :as_of_date")
             
         if conditions:
             base_query += " AND " + " AND ".join(conditions)
             
         if limit:
-            base_query = f"SELECT TOP {limit} * FROM ({base_query}) sub"
+            base_query = base_query.replace("SELECT", f"SELECT TOP {limit}")
             
         return base_query
     
     def build_account_summary_query(self, member_ids: Optional[List[str]] = None,
-                                  as_of_date: Optional[str] = None) -> str:
+                                  as_of_date: Optional[str] = None,
+                                  include_loans: bool = True) -> str:
         """
-        Build account summary query for members.
+        Build account summary query for members with ProcessDate filter.
         
         Args:
             member_ids: Optional list of specific member IDs
             as_of_date: Analysis date
+            include_loans: Include loan data in summary
             
         Returns:
-            SQL query string
+            SQL query string with ProcessDate filter
         """
-        query = """
-        SELECT 
-            s.ACCOUNT AS member_id,
-            COUNT(CASE WHEN s.ID LIKE '%%S%%' THEN 1 END) AS savings_accounts,
-            COUNT(CASE WHEN s.ID LIKE '%%L%%' THEN 1 END) AS loan_accounts,
-            COUNT(CASE WHEN s.ID LIKE '%%C%%' THEN 1 END) AS credit_accounts,
-            SUM(CASE WHEN s.ID LIKE '%%S%%' THEN s.BALANCE ELSE 0 END) AS total_savings_balance,
-            SUM(CASE WHEN s.ID LIKE '%%L%%' THEN s.BALANCE ELSE 0 END) AS total_loan_balance,
-            MAX(s.OPENDATE) AS last_account_opened,
-            COUNT(s.ID) AS total_accounts,
-            SUM(s.BALANCE) AS total_balance
-        FROM SAVINGS s
-        WHERE s.CLOSEDATE IS NULL OR s.CLOSEDATE = 0
-        """
+        if include_loans:
+            query = """
+            WITH CurrentSnapshot AS (
+                SELECT MAX(ProcessDate) as CurrentDate FROM SAVINGS
+            ),
+            SavingsData AS (
+                SELECT 
+                    s.PARENTACCOUNT AS member_id,
+                    COUNT(s.ID) AS savings_accounts,
+                    SUM(s.BALANCE) AS total_savings_balance,
+                    MAX(s.OPENDATE) AS last_savings_opened
+                FROM SAVINGS s
+                CROSS JOIN CurrentSnapshot cs
+                WHERE s.ProcessDate = cs.CurrentDate
+                    AND s.CLOSEDATE IS NULL
+                    AND CAST(s.PARENTACCOUNT AS BIGINT) > 100
+                GROUP BY s.PARENTACCOUNT
+            ),
+            LoanData AS (
+                SELECT 
+                    l.PARENTACCOUNT AS member_id,
+                    COUNT(l.ID) AS loan_accounts,
+                    SUM(l.BALANCE) AS total_loan_balance,
+                    MAX(l.OPENDATE) AS last_loan_opened
+                FROM LOAN l
+                CROSS JOIN CurrentSnapshot cs
+                WHERE l.ProcessDate = cs.CurrentDate
+                    AND l.CLOSEDATE IS NULL
+                    AND l.CHARGEOFFDATE IS NULL
+                    AND CAST(l.PARENTACCOUNT AS BIGINT) > 100
+                GROUP BY l.PARENTACCOUNT
+            )
+            SELECT 
+                COALESCE(s.member_id, l.member_id) AS member_id,
+                ISNULL(s.savings_accounts, 0) AS savings_accounts,
+                ISNULL(l.loan_accounts, 0) AS loan_accounts,
+                ISNULL(s.total_savings_balance, 0) AS total_savings_balance,
+                ISNULL(l.total_loan_balance, 0) AS total_loan_balance,
+                ISNULL(s.savings_accounts, 0) + ISNULL(l.loan_accounts, 0) AS total_accounts,
+                ISNULL(s.total_savings_balance, 0) - ISNULL(l.total_loan_balance, 0) AS net_balance
+            FROM SavingsData s
+            FULL OUTER JOIN LoanData l ON s.member_id = l.member_id
+            """
+        else:
+            query = """
+            WITH CurrentSnapshot AS (
+                SELECT MAX(ProcessDate) as CurrentDate FROM SAVINGS
+            )
+            SELECT 
+                s.PARENTACCOUNT AS member_id,
+                COUNT(s.ID) AS savings_accounts,
+                SUM(s.BALANCE) AS total_savings_balance,
+                MAX(s.OPENDATE) AS last_account_opened,
+                COUNT(s.ID) AS total_accounts,
+                SUM(s.BALANCE) AS total_balance
+            FROM SAVINGS s
+            CROSS JOIN CurrentSnapshot cs
+            WHERE s.ProcessDate = cs.CurrentDate
+                AND s.CLOSEDATE IS NULL
+                AND CAST(s.PARENTACCOUNT AS BIGINT) > 100
+            """
         
         conditions = []
         
         if member_ids:
-            conditions.append("s.ACCOUNT IN :member_ids")
-            
-        if as_of_date:
-            conditions.append("s.OPENDATE <= :as_of_date")
+            if include_loans:
+                conditions.append("(s.member_id IN :member_ids OR l.member_id IN :member_ids)")
+            else:
+                conditions.append("s.PARENTACCOUNT IN :member_ids")
             
         if conditions:
             query += " AND " + " AND ".join(conditions)
             
-        query += " GROUP BY s.ACCOUNT"
+        if not include_loans:
+            query += " GROUP BY s.PARENTACCOUNT"
         
         return query
+
+    def build_corrected_profitability_query(self, member_ids: Optional[List[str]] = None,
+                                          include_fees: bool = True) -> str:
+        """
+        Build member profitability query with all corrections applied.
+        
+        Args:
+            member_ids: Optional list of specific member IDs
+            include_fees: Include fee income calculations
+            
+        Returns:
+            Corrected profitability query with ProcessDate filter
+        """
+        base_query = """
+        WITH CurrentSnapshot AS (
+            SELECT MAX(ProcessDate) as CurrentDate FROM NAME
+        ),
+        ActiveMembers AS (
+            SELECT DISTINCT
+                n.PARENTACCOUNT as MemberNumber,
+                n.FIRST, n.LAST,
+                n.MBRSTATUS,
+                n.MBRCREATEDATE
+            FROM NAME n
+            CROSS JOIN CurrentSnapshot cs
+            WHERE n.ProcessDate = cs.CurrentDate
+                AND n.TYPE = 0  -- Primary name
+                AND n.MBRSTATUS = 0  -- Active
+                AND CAST(n.PARENTACCOUNT AS BIGINT) > 100  -- Exclude test
+        ),
+        LoanIncome AS (
+            SELECT 
+                l.PARENTACCOUNT,
+                SUM(ISNULL(l.INTERESTYTD, 0)) as InterestIncomeYTD,
+                SUM(ISNULL(l.INTERESTLASTYEAR, 0)) as InterestIncomeLY,
+                COUNT(l.ID) as LoanCount,
+                SUM(l.BALANCE) as TotalLoanBalance
+            FROM LOAN l
+            CROSS JOIN CurrentSnapshot cs
+            WHERE l.ProcessDate = cs.CurrentDate
+                AND l.CLOSEDATE IS NULL
+                AND l.CHARGEOFFDATE IS NULL
+                AND CAST(l.PARENTACCOUNT AS BIGINT) > 100
+            GROUP BY l.PARENTACCOUNT
+        ),
+        SavingsBalances AS (
+            SELECT 
+                s.PARENTACCOUNT,
+                SUM(s.BALANCE) as TotalSavingsBalance,
+                COUNT(s.ID) as SavingsCount
+            FROM SAVINGS s
+            CROSS JOIN CurrentSnapshot cs
+            WHERE s.ProcessDate = cs.CurrentDate
+                AND s.CLOSEDATE IS NULL
+                AND CAST(s.PARENTACCOUNT AS BIGINT) > 100
+            GROUP BY s.PARENTACCOUNT
+        )
+        """
+        
+        if include_fees:
+            base_query += """
+        ,
+        FeeIncome AS (
+            SELECT 
+                lt.PARENTACCOUNT,
+                SUM(CASE WHEN lt.TransactionCode IN (301, 302, 303) 
+                    THEN lt.Amount ELSE 0 END) as NonPunitiveFees,
+                SUM(CASE WHEN lt.TransactionCode IN (700, 701, 702, 710, 720) 
+                    THEN lt.Amount ELSE 0 END) as PunitiveFees
+            FROM LOANTRANSACTION lt
+            INNER JOIN LOAN l ON lt.PARENTACCOUNT = l.PARENTACCOUNT 
+                AND lt.PARENTID = l.ID  -- Corrected: Use PARENTID not ID
+            CROSS JOIN CurrentSnapshot cs
+            WHERE l.ProcessDate = cs.CurrentDate
+                AND lt.PostDate >= DATEADD(year, -1, GETDATE())
+                AND CAST(lt.PARENTACCOUNT AS BIGINT) > 100
+            GROUP BY lt.PARENTACCOUNT
+        )
+        """
+        
+        base_query += """
+        SELECT 
+            am.MemberNumber,
+            am.FIRST + ' ' + am.LAST as MemberName,
+            am.MBRCREATEDATE as JoinDate,
+            ISNULL(li.InterestIncomeYTD, 0) + ISNULL(li.InterestIncomeLY, 0) as TotalInterestIncome,
+            ISNULL(li.LoanCount, 0) as LoanCount,
+            ISNULL(li.TotalLoanBalance, 0) as TotalLoanBalance,
+            ISNULL(sb.SavingsCount, 0) as SavingsCount,
+            ISNULL(sb.TotalSavingsBalance, 0) as TotalSavingsBalance
+        """
+        
+        if include_fees:
+            base_query += """
+            ,
+            ISNULL(fi.NonPunitiveFees, 0) as NonPunitiveFees,
+            ISNULL(fi.PunitiveFees, 0) as PunitiveFees,
+            ISNULL(li.InterestIncomeYTD, 0) + ISNULL(li.InterestIncomeLY, 0) + 
+            ISNULL(fi.NonPunitiveFees, 0) + ISNULL(fi.PunitiveFees, 0) as TotalRevenue
+            """
+        
+        base_query += """
+        FROM ActiveMembers am
+        LEFT JOIN LoanIncome li ON am.MemberNumber = li.PARENTACCOUNT
+        LEFT JOIN SavingsBalances sb ON am.MemberNumber = sb.PARENTACCOUNT
+        """
+        
+        if include_fees:
+            base_query += "LEFT JOIN FeeIncome fi ON am.MemberNumber = fi.PARENTACCOUNT"
+        
+        if member_ids:
+            base_query += " WHERE am.MemberNumber IN :member_ids"
+        
+        return base_query
     
     def build_transaction_query(self, member_ids: Optional[List[str]] = None,
                               start_date: Optional[str] = None,

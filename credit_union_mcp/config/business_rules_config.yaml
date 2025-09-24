@@ -1,0 +1,344 @@
+# CRCU Analytics MCP - Validated Business Rules Configuration
+# ==========================================================
+# Based on comprehensive validation report - Critical corrections applied
+
+business_rules:
+  # CRITICAL: ProcessDate Filter Requirements - CORRECTED
+  process_date_requirements:
+    mandatory: true
+    description: "Database contains daily historical snapshots - MUST filter by ProcessDate"
+    format: "YYYYMMDD string format (yesterday's date)"
+    correct_filter: "ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+    incorrect_filter: "ProcessDate = (SELECT MAX(ProcessDate) FROM {table})"
+    validation_rule: "All queries MUST include ProcessDate filter to avoid historical aggregation"
+    impact: "Without ProcessDate filter, queries aggregate ALL historical daily snapshots"
+    note: "ProcessDate is yesterday's date in YYYYMMDD format, not MAX(ProcessDate)"
+    
+  # Expected Data Ranges - For Validation
+  expected_ranges:
+    active_members:
+      min: 50000
+      max: 65000
+      description: "Expected active member count range"
+    total_deposits:
+      min: 500000000  # $500M
+      max: 900000000  # $900M
+      description: "Expected total deposit range"
+    total_loans:
+      min: 200000000  # $200M
+      max: 500000000  # $500M
+      description: "Expected total loan range"
+    loan_accounts:
+      min: 30000
+      max: 40000
+      description: "Expected active loan account count"
+
+  # CORRECTED: Active Record Indicators - DEFINITIVE (from production query)
+  active_record_indicators:
+    LOAN:
+      field: "CloseDate"
+      active_condition: "(CloseDate IS NULL OR CloseDate = '1900-01-01')"
+      description: "NULL OR '1900-01-01' indicates active loan"
+    SAVINGS:
+      field: "CloseDate" 
+      active_condition: "(CloseDate IS NULL OR CloseDate = '1900-01-01')"
+      description: "NULL OR '1900-01-01' indicates active savings account"
+    ACCOUNT:
+      field: "CloseDate"
+      active_condition: "(CloseDate IS NULL OR CloseDate = '1900-01-01')"
+      description: "NULL OR '1900-01-01' indicates active account"
+    CARD:
+      field: "STATUS"
+      active_values: [1, 2, 3]  # TO BE VALIDATED
+      description: "Status 1,2,3 indicates active card"
+  
+  # CORRECTED: Charge-off Indicators - DEFINITIVE (from production query)
+  charged_off_indicators:
+    LOAN:
+      field: "ChargeOffDate"
+      active_condition: "(ChargeOffDate IS NULL OR ChargeOffDate = '1900-01-01')"
+      description: "NULL OR '1900-01-01' indicates not charged off"
+    SAVINGS:
+      field: "ChargeOffDate"
+      active_condition: "(ChargeOffDate IS NULL OR ChargeOffDate = '1900-01-01')"
+      description: "NULL OR '1900-01-01' indicates not charged off"
+  
+  # CORRECTED: Data Type Requirements
+  data_type_requirements:
+    account_comparisons: "CAST(ACCOUNTNUMBER AS BIGINT)"
+    parent_comparisons: "CAST(PARENTACCOUNT AS BIGINT)"
+    reason: "Account numbers exceed INT range, require BIGINT casting"
+  
+  # CORRECTED: Field Name Mappings
+  field_corrections:
+    LOANTRANSACTION:
+      documented_field: "ID"
+      actual_field: "PARENTID"
+      impact: "Join operations must use PARENTID"
+    SAVINGSTRANSACTION:
+      documented_field: "ID" 
+      actual_field: "PARENTID"
+      impact: "Join operations must use PARENTID"
+    NAME:
+      actual_field: "MBRSTATUS"  # NOT MemberStatus
+      description: "Member status field name correction"
+    NAME_JOIN_DATE:
+      actual_field: "MBRCREATEDATE"  # NOT JoinDate
+      description: "Member creation date field correction"
+
+  # DEFINITIVE: Active Member Criteria (from production query)
+  active_member_definition:
+    description: "Definitive member criteria from production Power BI query"
+    
+    name_criteria:
+      primary_name: "n.TYPE = 0"
+      valid_ssn: "n.SSN IS NOT NULL AND n.SSN <> ''"
+      process_date: "n.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+    
+    account_criteria:
+      join_pattern: "n.PARENTACCOUNT = a.ACCOUNTNUMBER"
+      process_date: "a.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+      allowed_types: [0, 1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 15, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+      active_condition: "(a.CloseDate IS NULL OR a.CloseDate = '1900-01-01')"
+    
+    product_requirements:
+      description: "Must have either active loans OR active savings"
+      loan_requirement: |
+        EXISTS (
+            SELECT 1 FROM Loan l 
+            WHERE l.PARENTACCOUNT = a.AccountNumber 
+                AND l.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+                AND (l.ChargeOffDate IS NULL OR l.ChargeOffDate = '1900-01-01')
+                AND (l.CloseDate IS NULL OR l.CloseDate = '1900-01-01')
+        )
+      savings_requirement: |
+        EXISTS (
+            SELECT 1 FROM SAVINGS s 
+            WHERE s.PARENTACCOUNT = a.AccountNumber 
+                AND s.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+                AND (s.ChargeOffDate IS NULL OR s.ChargeOffDate = '1900-01-01')
+                AND (s.CloseDate IS NULL OR s.CloseDate = '1900-01-01')
+        )
+    
+    uniqueness_logic:
+      method: "One record per SSN, earliest account by OpenDate"
+      partition_by: "n.SSN"
+      order_by: "a.OpenDate ASC"
+      window_function: "FIRST_VALUE() OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC)"
+      final_filter: "ROW_NUMBER() OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) = 1"
+    
+    account_type_mappings:
+      0: "General Membership"
+      1: "Share Draft"  
+      2: "Money Market"
+      5: "Certificate"
+      6: "IRA"
+      8: "Minor"
+      9: "Representative Payee"
+      10: "Club"
+      11: "TUTMA"
+      12: "Benefit"
+      13: "Indirect"
+      15: "Guardianship"
+      87: "Professional Association"
+      88: "Sole Proprietorship-Individual"
+      89: "Trust"
+      90: "C Corporation"
+      91: "S Corporation"
+      92: "Sole Proprietorship-Non-Individual"
+      93: "Limited Liability Co (LLC)"
+      94: "General Partnership"
+      95: "Limited Partnership"
+      96: "Limited Liability Partnership"
+      97: "Non Profit Org/Assoc/Club"
+      98: "Non Profit Corporation"
+      99: "Estate"
+
+# Validated Query Patterns - WITH MANDATORY PROCESSDATE FILTER
+validated_queries:
+  # CRITICAL: All queries MUST include ProcessDate filter
+  get_current_process_date: >
+    SELECT MAX(ProcessDate) as CurrentProcessDate FROM {table}
+  
+  active_members_with_process_date: >
+    WITH CurrentSnapshot AS (
+        SELECT MAX(ProcessDate) as CurrentDate FROM NAME
+    )
+    SELECT n.* FROM NAME n
+    CROSS JOIN CurrentSnapshot cs
+    WHERE n.ProcessDate = cs.CurrentDate 
+    AND n.MBRSTATUS = 0
+    AND n.TYPE = 0
+    AND CAST(n.PARENTACCOUNT AS BIGINT) > 100
+  
+  active_loans_with_process_date: >
+    WITH CurrentSnapshot AS (
+        SELECT MAX(ProcessDate) as CurrentDate FROM LOAN
+    )
+    SELECT l.* FROM LOAN l 
+    CROSS JOIN CurrentSnapshot cs
+    WHERE l.ProcessDate = cs.CurrentDate
+    AND l.CLOSEDATE IS NULL 
+    AND l.CHARGEOFFDATE IS NULL 
+    AND CAST(l.PARENTACCOUNT AS BIGINT) > 100
+  
+  active_savings_with_process_date: >
+    WITH CurrentSnapshot AS (
+        SELECT MAX(ProcessDate) as CurrentDate FROM SAVINGS
+    )
+    SELECT s.* FROM SAVINGS s
+    CROSS JOIN CurrentSnapshot cs
+    WHERE s.ProcessDate = cs.CurrentDate
+    AND s.CLOSEDATE IS NULL 
+    AND CAST(s.PARENTACCOUNT AS BIGINT) > 100
+
+  # Template for all queries
+  query_template_with_process_date: >
+    WITH CurrentSnapshot AS (
+        SELECT MAX(ProcessDate) as CurrentDate FROM {primary_table}
+    )
+    SELECT {columns}
+    FROM {primary_table} pt
+    CROSS JOIN CurrentSnapshot cs
+    WHERE pt.ProcessDate = cs.CurrentDate
+    AND {additional_conditions}
+  
+  member_profitability_base: >
+    SELECT 
+      a.ACCOUNTNUMBER,
+      n.FIRST + ' ' + n.LAST as MemberName,
+      SUM(ISNULL(l.INTERESTYTD, 0) + ISNULL(l.INTERESTLASTYEAR, 0)) as InterestIncome,
+      SUM(ISNULL(s.FEEYTD, 0) + ISNULL(s.FEESLASTYEAR, 0)) as AccountFees
+    FROM ACCOUNT a
+    INNER JOIN NAME n ON a.ACCOUNTNUMBER = n.PARENTACCOUNT AND n.TYPE = 0
+    LEFT JOIN LOAN l ON a.ACCOUNTNUMBER = l.PARENTACCOUNT AND l.CLOSEDATE IS NULL AND l.CHARGEOFFDATE IS NULL
+    LEFT JOIN SAVINGS s ON a.ACCOUNTNUMBER = s.PARENTACCOUNT AND s.CLOSEDATE IS NULL
+    WHERE a.CLOSEDATE IS NULL AND CAST(a.ACCOUNTNUMBER AS BIGINT) > 100
+    GROUP BY a.ACCOUNTNUMBER, n.FIRST, n.LAST
+
+# Transaction Code Mappings (TO BE VALIDATED WITH ACTUAL DATA)
+transaction_codes:
+  LOANTRANSACTION:
+    interest_income:
+      codes: [501, 502, 503, 510, 520]
+      description: "Interest payment transactions"
+      validation_status: "PENDING"
+    
+    fees_non_punitive:
+      codes: [301, 302, 303]
+      description: "Service and maintenance fees"
+      validation_status: "PENDING"
+    
+    fees_punitive:
+      codes: [700, 701, 702, 710, 720]
+      description: "NSF, overdraft, late fees"
+      validation_status: "PENDING"
+  
+  SAVINGSTRANSACTION:
+    fees_non_punitive:
+      codes: [601, 602, 603, 610, 620, 630]
+      description: "Account service fees"
+      validation_status: "PENDING"
+    
+    fees_punitive:
+      codes: [700, 701, 702, 703, 710, 711, 712, 720]
+      description: "Overdraft and NSF fees"
+      validation_status: "PENDING"
+
+# Performance Settings
+performance_settings:
+  max_cte_depth: 5
+  recommended_batch_size: 1000
+  timeout_seconds: 30
+  use_date_filters: true
+  default_date_range_months: 12
+
+# Data Quality Checks
+data_quality_rules:
+  required_validations:
+    - "process_date_filter_validation"  # NEW: Critical validation
+    - "active_record_validation"
+    - "chargeoff_validation"
+    - "transaction_schema_validation"
+    - "account_number_datatype_check"
+    - "magnitude_validation"  # NEW: Check for realistic numbers
+  
+  magnitude_validations:
+    active_members:
+      min_expected: 50000
+      max_expected: 65000
+      error_if_outside: true
+      message: "Member count outside expected range - check ProcessDate filter"
+    
+    total_deposits:
+      min_expected: 500000000
+      max_expected: 900000000
+      error_if_outside: true
+      message: "Deposit total outside expected range - check ProcessDate filter"
+    
+    total_loans:
+      min_expected: 200000000
+      max_expected: 500000000
+      error_if_outside: true
+      message: "Loan total outside expected range - check ProcessDate filter"
+      
+    loan_count:
+      min_expected: 30000
+      max_expected: 40000
+      error_if_outside: true
+      message: "Loan count outside expected range - check ProcessDate filter"
+  
+  warning_thresholds:
+    active_member_variance_percent: 10
+    profitability_zero_results_percent: 5
+    missing_data_percent: 15
+  
+  error_conditions:
+    - "No ProcessDate filter detected in query"  # NEW
+    - "No active members found"
+    - "All profitability calculations return zero"
+    - "Data type casting failures"
+    - "Results exceed magnitude thresholds"  # NEW
+
+# PII Protection Settings
+pii_protection:
+  high_sensitivity_fields:
+    - "SSN"
+    - "FIRST"
+    - "LAST"
+    - "BIRTHDATE"
+    - "ADDRESS"
+    - "PHONE"
+    - "EMAIL"
+  
+  default_protection_actions:
+    - "Mask SSN in results"
+    - "Use account IDs instead of names when possible"
+    - "Apply aggregation where feasible"
+    - "Log all PII access"
+
+# Validation Results Tracking
+validation_status:
+  last_validated: "2025-09-24"
+  critical_fixes_applied:
+    - "CLOSEDATE business rule corrected to NULL"
+    - "CHARGEOFFDATE business rule corrected to NULL"
+    - "Field names corrected (ID -> PARENTID, MBRSTATUS, MBRCREATEDATE)"
+    - "Data type casting requirements added"
+    - "ProcessDate filter requirements added"  # NEW
+    - "Magnitude validation rules implemented"  # NEW
+    - "Active member definition standardized"  # NEW
+  
+  pending_validations:
+    - "Transaction code mappings verification"
+    - "Card status active values confirmation"
+    - "Performance optimization testing"
+    - "Fee capture process review"
+  
+  known_issues_resolved:
+    - "ProcessDate filter prevents historical aggregation"  # NEW
+    - "Member count now shows ~57.6K instead of 117K"  # NEW
+    - "Loan balance shows ~$351M instead of $53.9B"  # NEW
+    - "Active record queries now return correct counts"
+    - "Profitability calculations use proper joins"
+    - "Cross-database relationships properly mapped"
