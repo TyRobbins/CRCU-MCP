@@ -28,6 +28,9 @@ from src.database.connection import DatabaseManager
 from src.database.data_catalog import DataCatalog
 from src.orchestration.coordinator import AgentCoordinator
 from src.agents.base_agent import AnalysisContext
+from src.utils.config_manager import get_config_manager, Environment
+from src.utils.monitoring import get_monitoring_manager, start_monitoring, monitor_performance
+from src.utils.performance_utils import get_performance_tracker
 
 
 class CreditUnionMCP:
@@ -43,6 +46,8 @@ class CreditUnionMCP:
         self.server = Server("credit-union-analytics")
         self.db_manager: Optional[DatabaseManager] = None
         self.coordinator: Optional[AgentCoordinator] = None
+        self.config_manager = get_config_manager()
+        self.monitoring_manager = get_monitoring_manager()
         self._setup_logging()
         
     def _setup_logging(self):
@@ -71,6 +76,15 @@ class CreditUnionMCP:
         """Initialize database connections and agents."""
         try:
             print("Starting MCP server setup...", file=sys.stderr)
+            
+            # Initialize data catalog FIRST - this drives all data access decisions
+            self.data_catalog = DataCatalog()
+            print("Data catalog initialized - all database access will use data dictionary", file=sys.stderr)
+            logger.info("Data catalog initialized for data dictionary-first approach")
+            
+            # Start monitoring system
+            start_monitoring()
+            self.monitoring_manager.start_monitoring()
             
             # Load database configuration (relative to project root, not src/)
             project_root = Path(__file__).parent.parent
@@ -178,6 +192,47 @@ class CreditUnionMCP:
         async def list_tools() -> List[Tool]:
             """List all available tools."""
             return [
+                # Data Dictionary Tools (MUST BE USED FIRST)
+                Tool(
+                    name="get_data_dictionary_plan",
+                    description="GET DATA DICTIONARY ANALYSIS PLAN - Must be called BEFORE any analysis to understand data sources, business rules, and query patterns",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "analysis_type": {
+                                "type": "string",
+                                "enum": ["financial_performance", "member_analytics", "portfolio_risk", "loan_servicing", "collections", "account_origination", "delinquency_management", "card_management", "transaction_analysis"],
+                                "description": "Type of analysis to get plan for"
+                            },
+                            "parameters": {
+                                "type": "object",
+                                "description": "Additional parameters for the analysis",
+                                "additionalProperties": True
+                            }
+                        },
+                        "required": ["analysis_type"]
+                    }
+                ),
+                Tool(
+                    name="validate_analysis_request", 
+                    description="Validate analysis request against data dictionary before execution",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "analysis_type": {
+                                "type": "string",
+                                "description": "Type of analysis to validate"
+                            },
+                            "parameters": {
+                                "type": "object",
+                                "description": "Analysis parameters to validate",
+                                "additionalProperties": True
+                            }
+                        },
+                        "required": ["analysis_type", "parameters"]
+                    }
+                ),
+                
                 # Database Tools
                 Tool(
                     name="execute_query",
@@ -470,8 +525,14 @@ class CreditUnionMCP:
             try:
                 logger.info(f"Tool called: {name} with arguments: {arguments}")
                 
+                # Data Dictionary tools (MUST BE USED FIRST)
+                if name == "get_data_dictionary_plan":
+                    return await self._handle_get_data_dictionary_plan(arguments)
+                elif name == "validate_analysis_request":
+                    return await self._handle_validate_analysis_request(arguments)
+                
                 # Database tools
-                if name == "execute_query":
+                elif name == "execute_query":
                     return await self._handle_execute_query(arguments)
                 elif name == "get_tables":
                     return await self._handle_get_tables(arguments)
@@ -707,9 +768,55 @@ class CreditUnionMCP:
             text=json.dumps(capabilities, indent=2)
         )]
     
+    async def _handle_get_data_dictionary_plan(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Handle data dictionary analysis plan request - MANDATORY FIRST STEP."""
+        analysis_type = arguments["analysis_type"]
+        parameters = arguments.get("parameters", {})
+        
+        # Get comprehensive analysis plan from data catalog
+        analysis_plan = DataCatalog.get_analysis_plan(analysis_type, parameters)
+        
+        # Add data catalog summary for reference
+        analysis_plan["data_catalog_summary"] = DataCatalog.get_data_location_summary()
+        
+        return [TextContent(
+            type="text",
+            text=json.dumps(analysis_plan, indent=2, default=str)
+        )]
+    
+    async def _handle_validate_analysis_request(self, arguments: Dict[str, Any]) -> List[TextContent]:
+        """Handle analysis request validation against data dictionary."""
+        analysis_type = arguments["analysis_type"]
+        parameters = arguments["parameters"]
+        
+        # Validate against data catalog
+        validation_results = DataCatalog.validate_analysis_request(analysis_type, parameters)
+        
+        return [TextContent(
+            type="text", 
+            text=json.dumps(validation_results, indent=2)
+        )]
+    
     async def _handle_health_check(self) -> List[TextContent]:
         """Handle health check request."""
-        health_status = await self.coordinator.health_check()
+        if self.coordinator:
+            health_status = await self.coordinator.health_check()
+        else:
+            health_status = {
+                'status': 'limited',
+                'message': 'Running in demo mode without full connectivity'
+            }
+        
+        # Add system health information
+        monitoring_health = self.monitoring_manager.health_checker.get_health_summary()
+        health_status.update({
+            'monitoring': monitoring_health,
+            'performance': get_performance_tracker().get_summary(),
+            'data_catalog': {
+                'initialized': hasattr(self, 'data_catalog'),
+                'routing_rules_count': len(DataCatalog.ROUTING_RULES)
+            }
+        })
         
         return [TextContent(
             type="text",

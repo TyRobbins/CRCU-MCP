@@ -335,3 +335,276 @@ class DataCatalog:
             },
             "routing_strategy": "ARCUSYM000 primary for operational data, TEMENOS for specialized workflows"
         }
+    
+    @classmethod
+    def get_analysis_plan(cls, analysis_type: str, parameters: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Get comprehensive analysis plan from data dictionary BEFORE querying databases.
+        This is the mandatory first step for all agent analyses.
+        
+        Args:
+            analysis_type: Type of analysis to perform
+            parameters: Additional analysis parameters
+            
+        Returns:
+            Complete analysis plan with data sources, business rules, and query patterns
+        """
+        parameters = parameters or {}
+        
+        # Get primary database and routing
+        primary_db = cls.get_primary_database_for_analysis(analysis_type)
+        recommended_tables = cls.get_tables_for_analysis(analysis_type)
+        use_secondary = cls.should_use_secondary_database(analysis_type)
+        
+        # Get relevant data categories
+        data_categories = cls._get_data_categories_for_analysis(analysis_type)
+        
+        # Build comprehensive plan
+        analysis_plan = {
+            "analysis_type": analysis_type,
+            "primary_database": primary_db,
+            "use_secondary_database": use_secondary,
+            "recommended_tables": recommended_tables,
+            "data_categories": data_categories,
+            "business_rules": cls._get_business_rules_for_analysis(analysis_type),
+            "query_patterns": cls._get_query_patterns_for_analysis(analysis_type),
+            "data_validation_rules": cls._get_data_validation_rules(analysis_type),
+            "performance_hints": cls._get_performance_hints(analysis_type),
+            "pii_considerations": cls._get_pii_considerations_for_analysis(analysis_type),
+            "routing_explanation": cls.ROUTING_RULES.get(analysis_type, {}).get("reason", "Standard routing")
+        }
+        
+        return analysis_plan
+    
+    @classmethod
+    def _get_data_categories_for_analysis(cls, analysis_type: str) -> Dict[str, Any]:
+        """Get relevant data categories for analysis type."""
+        category_mapping = {
+            "financial_performance": {
+                "primary_data": cls.DEPOSIT_DATA,
+                "secondary_data": cls.LOAN_DATA,
+                "supporting_data": cls.MEMBER_DATA
+            },
+            "member_analytics": {
+                "primary_data": cls.MEMBER_DATA,
+                "secondary_data": cls.DEPOSIT_DATA,
+                "supporting_data": cls.TRANSACTION_DATA
+            },
+            "portfolio_risk": {
+                "primary_data": cls.LOAN_DATA,
+                "secondary_data": cls.COLLECTIONS_DATA,
+                "supporting_data": cls.MEMBER_DATA
+            },
+            "loan_servicing": {
+                "primary_data": cls.LOAN_DATA,
+                "supporting_data": cls.MEMBER_DATA
+            },
+            "collections": {
+                "primary_data": cls.COLLECTIONS_DATA,
+                "secondary_data": cls.LOAN_DATA,
+                "supporting_data": cls.MEMBER_DATA
+            },
+            "account_origination": {
+                "primary_data": cls.ORIGINATION_DATA,
+                "supporting_data": cls.MEMBER_DATA
+            }
+        }
+        
+        return category_mapping.get(analysis_type, {
+            "primary_data": cls.MEMBER_DATA,
+            "note": "Using default member data for unknown analysis type"
+        })
+    
+    @classmethod
+    def _get_business_rules_for_analysis(cls, analysis_type: str) -> List[str]:
+        """Get business rules that must be applied for analysis type."""
+        common_rules = [
+            "Always filter out test accounts (ACCOUNT < 100 typically test)",
+            "Respect PII protection requirements",
+            "Use active status filters for current analysis",
+            "Apply date range filters for performance"
+        ]
+        
+        specific_rules = {
+            "member_analytics": [
+                "STATUS = 0 for active members only",
+                "Use TYPE = 0 for primary name records",
+                "CLOSEDATE = '19000101' means account is open"
+            ],
+            "financial_performance": [
+                "CLOSEDATE = '19000101' for active accounts",
+                "Sum balances across all product types",
+                "Exclude charged-off accounts unless specifically analyzing losses"
+            ],
+            "portfolio_risk": [
+                "CHARGEOFFDATE = '19000101' means not charged off",
+                "Include delinquency status from both systems",
+                "Use TEMENOS for collection workflow status"
+            ],
+            "collections": [
+                "Focus on accounts with CHARGEOFFDATE != '19000101' OR delinquent status",
+                "Use TEMENOS for workflow and queue management",
+                "Cross-reference with ARCUSYM000 for account details"
+            ]
+        }
+        
+        rules = common_rules.copy()
+        rules.extend(specific_rules.get(analysis_type, []))
+        return rules
+    
+    @classmethod
+    def _get_query_patterns_for_analysis(cls, analysis_type: str) -> Dict[str, str]:
+        """Get recommended query patterns for analysis type."""
+        patterns = {
+            "member_analytics": {
+                "active_members": """
+                SELECT ACCOUNT, FIRST, LAST, JOINDATE, STATUS
+                FROM NAME 
+                WHERE TYPE = 0 AND STATUS = 0 AND ACCOUNT > 100
+                """,
+                "member_balances": """
+                SELECT m.ACCOUNT, m.FIRST, m.LAST, 
+                       COALESCE(SUM(s.BALANCE), 0) as TOTAL_DEPOSITS,
+                       COALESCE(SUM(l.BALANCE), 0) as TOTAL_LOANS
+                FROM NAME m
+                LEFT JOIN SAVINGS s ON m.ACCOUNT = s.PARENTACCOUNT AND s.CLOSEDATE = '19000101'
+                LEFT JOIN LOAN l ON m.ACCOUNT = l.PARENTACCOUNT AND l.CLOSEDATE = '19000101'
+                WHERE m.TYPE = 0 AND m.STATUS = 0 AND m.ACCOUNT > 100
+                GROUP BY m.ACCOUNT, m.FIRST, m.LAST
+                """
+            },
+            "financial_performance": {
+                "deposit_summary": """
+                SELECT TYPE, COUNT(*) as ACCOUNT_COUNT, SUM(BALANCE) as TOTAL_BALANCE
+                FROM SAVINGS 
+                WHERE CLOSEDATE = '19000101' AND PARENTACCOUNT > 100
+                GROUP BY TYPE
+                """,
+                "loan_summary": """
+                SELECT TYPE, COUNT(*) as LOAN_COUNT, SUM(BALANCE) as TOTAL_BALANCE,
+                       SUM(ORIGINALBALANCE) as TOTAL_ORIGINAL
+                FROM LOAN
+                WHERE CLOSEDATE = '19000101' AND CHARGEOFFDATE = '19000101' AND PARENTACCOUNT > 100
+                GROUP BY TYPE
+                """
+            },
+            "portfolio_risk": {
+                "loan_portfolio": """
+                SELECT TYPE, BALANCE, ORIGINALBALANCE, INTERESTRATE, DUEDATE,
+                       CASE WHEN CHARGEOFFDATE != '19000101' THEN 'CHARGED_OFF' ELSE 'ACTIVE' END as STATUS
+                FROM LOAN
+                WHERE PARENTACCOUNT > 100 AND CLOSEDATE = '19000101'
+                """
+            }
+        }
+        
+        return patterns.get(analysis_type, {
+            "basic_query": "-- Use data dictionary to build appropriate queries for " + analysis_type
+        })
+    
+    @classmethod
+    def _get_data_validation_rules(cls, analysis_type: str) -> List[str]:
+        """Get data validation rules for analysis type."""
+        return [
+            "Verify account numbers are positive integers",
+            "Check date fields are in proper YYYYMMDD format",
+            "Validate currency fields are numeric",
+            "Ensure status codes are within valid ranges",
+            "Cross-check totals across related tables",
+            "Verify PII fields are properly protected"
+        ]
+    
+    @classmethod
+    def _get_performance_hints(cls, analysis_type: str) -> List[str]:
+        """Get performance optimization hints for analysis type."""
+        return [
+            "Use appropriate date range filters to limit data volume",
+            "Index on ACCOUNT/PARENTACCOUNT fields for joins",
+            "Filter on CLOSEDATE early in WHERE clauses",
+            "Use EXISTS instead of IN for large subqueries",
+            "Consider using TOP clauses for large result sets",
+            "Batch process large data sets rather than single queries"
+        ]
+    
+    @classmethod
+    def _get_pii_considerations_for_analysis(cls, analysis_type: str) -> Dict[str, Any]:
+        """Get PII protection requirements for analysis type."""
+        pii_fields = {
+            "member_analytics": {
+                "pii_fields": ["SSN", "FIRST", "LAST", "ADDRESS", "PHONE", "EMAIL", "BIRTHDATE"],
+                "protection_level": "HIGH",
+                "recommendations": [
+                    "Mask or hash SSN in results",
+                    "Use member IDs instead of names when possible",
+                    "Aggregate data rather than individual records",
+                    "Apply role-based access controls"
+                ]
+            },
+            "financial_performance": {
+                "pii_fields": ["SSN", "FIRST", "LAST"],
+                "protection_level": "MEDIUM", 
+                "recommendations": [
+                    "Focus on aggregate numbers rather than individual accounts",
+                    "Use account numbers instead of member names",
+                    "Ensure results don't allow re-identification"
+                ]
+            },
+            "portfolio_risk": {
+                "pii_fields": ["SSN", "FIRST", "LAST", "ADDRESS"],
+                "protection_level": "MEDIUM",
+                "recommendations": [
+                    "Use account identifiers rather than member names",
+                    "Focus on risk categories and trends",
+                    "Aggregate by loan types rather than individuals"
+                ]
+            }
+        }
+        
+        return pii_fields.get(analysis_type, {
+            "pii_fields": ["SSN", "FIRST", "LAST"],
+            "protection_level": "STANDARD",
+            "recommendations": ["Apply standard PII protection practices"]
+        })
+    
+    @classmethod
+    def validate_analysis_request(cls, analysis_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate analysis request against data dictionary before execution.
+        
+        Args:
+            analysis_type: Type of analysis requested
+            parameters: Analysis parameters
+            
+        Returns:
+            Validation results with any issues or recommendations
+        """
+        validation = {
+            "valid": True,
+            "warnings": [],
+            "errors": [],
+            "recommendations": []
+        }
+        
+        # Check if analysis type is supported
+        if analysis_type not in cls.ROUTING_RULES:
+            validation["warnings"].append(f"Analysis type '{analysis_type}' not found in routing rules")
+            validation["recommendations"].append("Consider using a standard analysis type for optimal data routing")
+        
+        # Validate database selection
+        requested_db = parameters.get("database")
+        recommended_db = cls.get_primary_database_for_analysis(analysis_type)
+        
+        if requested_db and requested_db != recommended_db:
+            validation["warnings"].append(
+                f"Requested database '{requested_db}' differs from recommended '{recommended_db}' for {analysis_type}"
+            )
+            validation["recommendations"].append(f"Consider using {recommended_db} for optimal results")
+        
+        # Check for required parameters
+        if analysis_type == "member_analytics":
+            method = parameters.get("method")
+            if not method:
+                validation["warnings"].append("Member analytics analysis should specify a method")
+                validation["recommendations"].append("Use methods: active_members, demographics, balances, etc.")
+        
+        return validation

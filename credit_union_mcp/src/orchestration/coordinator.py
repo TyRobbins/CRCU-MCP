@@ -12,6 +12,7 @@ from datetime import datetime
 from loguru import logger
 
 from ..database.connection import DatabaseManager
+from ..database.data_catalog import DataCatalog
 from ..agents.base_agent import AnalysisContext, AnalysisResult
 from ..agents.financial_performance import FinancialPerformanceAgent
 from ..agents.portfolio_risk import PortfolioRiskAgent
@@ -55,7 +56,7 @@ class AgentCoordinator:
     
     async def route_request(self, context: AnalysisContext) -> AnalysisResult:
         """
-        Route analysis request to appropriate agent(s).
+        Route analysis request to appropriate agent(s) with data dictionary consultation.
         
         Args:
             context: Analysis context with request details
@@ -64,6 +65,18 @@ class AgentCoordinator:
             AnalysisResult from the appropriate agent(s)
         """
         try:
+            # 🚨 MANDATORY DATA DICTIONARY CONSULTATION BEFORE ROUTING 🚨
+            self.logger.info("Auto-consulting data dictionary before routing request...")
+            data_plan = DataCatalog.get_analysis_plan(context.agent_type, context.parameters)
+            
+            # Update context with data dictionary insights
+            context.metadata = context.metadata or {}
+            context.metadata['data_dictionary_consulted'] = True
+            context.metadata['recommended_database'] = data_plan.get('primary_database')
+            context.metadata['recommended_tables'] = data_plan.get('recommended_tables', [])
+            
+            self.logger.info(f"Data dictionary consulted: routing {context.agent_type} to {data_plan.get('primary_database')} database")
+            
             # Extract agent specification from context
             requested_agent = context.agent_type
             

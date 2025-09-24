@@ -211,8 +211,8 @@ class DataFetcher:
             return result.iloc[0]['active_member_count'] if not result.empty else 0
     
     @cache_with_ttl(ttl=3600)  # 1 hour cache
-    def get_new_members_period(self, database: str = "ARCUSYM000",
-                             start_date: str, end_date: str) -> int:
+    def get_new_members_period(self, start_date: str, end_date: str,
+                             database: str = "ARCUSYM000") -> int:
         """
         Get new members for a specific period.
         
