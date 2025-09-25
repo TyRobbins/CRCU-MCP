@@ -880,7 +880,445 @@ recommended_indexes:
     columns: ["AccountIdentifier", "DelinquentFlag", "ActiveFlag"]
     type: "NONCLUSTERED"
 
-# Validation Results Tracking
+# ENHANCED RELATIONSHIP MAPPING CONFIGURATION
+# ============================================
+# Addresses critical relationship mismatches identified in database analysis
+
+enhanced_table_relationships:
+  primary_account_identifier: "ACCOUNT.ACCOUNTNUMBER"
+  
+  demographic_sources:
+    primary:
+      table: "NAME"
+      join: "ACCOUNT.ACCOUNTNUMBER = NAME.PARENTACCOUNT"
+      filter: "NAME.ORDINAL = 0 AND NAME.TYPE = 0"
+      description: "Primary demographic source - use NAME table instead of MEMBERREC"
+      fields_available: ["FIRST", "LAST", "BIRTHDATE", "ADDRESS", "PHONE", "SSN"]
+      
+    secondary:
+      table: "MEMBERREC"
+      join: "Complex - requires mapping table or substring match"
+      note: "MEMBERID format (varchar 17) incompatible with ACCOUNTNUMBER (varchar 10)"
+      issue: "Direct join not possible - use NAME table for demographics"
+      memberid_format: "20081930000000007"
+      accountnumber_format: "0000058219"
+  
+  product_relationships:
+    savings:
+      join: "ACCOUNT.ACCOUNTNUMBER = SAVINGS.PARENTACCOUNT"
+      active_filter: "SAVINGS.CLOSEDATE IS NULL OR SAVINGS.CLOSEDATE = '1900-01-01'"
+      process_date_filter: "SAVINGS.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+      
+    loans:
+      join: "ACCOUNT.ACCOUNTNUMBER = LOAN.PARENTACCOUNT"
+      active_filter: "LOAN.CLOSEDATE IS NULL OR LOAN.CLOSEDATE = '1900-01-01'"
+      chargeoff_filter: "LOAN.CHARGEOFFDATE IS NULL OR LOAN.CHARGEOFFDATE = '1900-01-01'"
+      process_date_filter: "LOAN.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+      
+    cards:
+      join: "ACCOUNT.ACCOUNTNUMBER = CARD.PARENTACCOUNT"
+      active_filter: "CARD.STATUS = 1"
+      process_date_filter: "CARD.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+  
+  transaction_relationships:
+    savings_trans:
+      join: "SAVINGS.ID = SAVINGSTRANSACTION.PARENTID"
+      date_field: "EFFECTIVEDATE"
+      amount_field: "BALANCECHANGE"
+      missing_fields: ["ProcessDate"]
+      available_date_fields: ["EFFECTIVEDATE", "POSTDATE", "ACTIVITYDATE"]
+      
+    loan_trans:
+      join: "LOAN.ID = LOANTRANSACTION.PARENTID"
+      date_field: "EFFECTIVEDATE"
+      amount_field: "TRANAMOUNT"
+      missing_fields: ["ProcessDate"]
+      available_date_fields: ["EFFECTIVEDATE", "POSTDATE", "ACTIVITYDATE"]
+
+# HELPER QUERY PATTERNS FOR COMMON OPERATIONS
+# ==========================================
+# Standardized patterns to avoid relationship mapping errors
+
+helper_query_patterns:
+  
+  get_active_members_base_query:
+    description: "Standard base query for active members"
+    query: |
+      SELECT DISTINCT a.ACCOUNTNUMBER
+      FROM ACCOUNT a
+      WHERE a.CLOSEDATE IS NULL OR a.CLOSEDATE = '1900-01-01'
+      AND a.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      AND a.TYPE = 0  -- General Membership
+
+  get_demographics_query:
+    description: "Get demographics from NAME table instead of MEMBERREC"
+    query: |
+      SELECT 
+          n.PARENTACCOUNT as AccountNumber,
+          n.BIRTHDATE,
+          n.FIRST,
+          n.LAST,
+          n.SSN,
+          DATEDIFF(YEAR, n.BIRTHDATE, GETDATE()) as Age
+      FROM NAME n
+      WHERE n.ORDINAL = 0  -- Primary name
+      AND n.TYPE = 0  -- Primary type
+      AND n.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+
+  get_member_product_summary:
+    description: "Summary of products per member using correct relationships"
+    query: |
+      SELECT 
+          a.ACCOUNTNUMBER,
+          n.FIRST + ' ' + n.LAST as MemberName,
+          COUNT(DISTINCT s.ID) as SavingsCount,
+          COUNT(DISTINCT l.ID) as LoanCount,
+          COUNT(DISTINCT c.CARDNUMBER) as CardCount,
+          SUM(ISNULL(s.BALANCE, 0)) as TotalSavings,
+          SUM(ISNULL(l.BALANCE, 0)) as TotalLoans
+      FROM ACCOUNT a
+      INNER JOIN NAME n ON a.ACCOUNTNUMBER = n.PARENTACCOUNT AND n.TYPE = 0 AND n.ORDINAL = 0
+      LEFT JOIN SAVINGS s ON a.ACCOUNTNUMBER = s.PARENTACCOUNT 
+          AND (s.CLOSEDATE IS NULL OR s.CLOSEDATE = '1900-01-01')
+          AND s.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      LEFT JOIN LOAN l ON a.ACCOUNTNUMBER = l.PARENTACCOUNT 
+          AND (l.CLOSEDATE IS NULL OR l.CLOSEDATE = '1900-01-01')
+          AND (l.CHARGEOFFDATE IS NULL OR l.CHARGEOFFDATE = '1900-01-01')
+          AND l.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      LEFT JOIN CARD c ON a.ACCOUNTNUMBER = c.PARENTACCOUNT 
+          AND c.STATUS = 1
+          AND c.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      WHERE (a.CLOSEDATE IS NULL OR a.CLOSEDATE = '1900-01-01')
+      AND a.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      AND n.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      GROUP BY a.ACCOUNTNUMBER, n.FIRST, n.LAST
+
+# TRANSACTION ANALYSIS PATTERNS
+# =============================
+# Channel analysis and digital engagement tracking
+
+transaction_analysis_patterns:
+  
+  channel_analysis_by_source_code:
+    description: "Transaction channel analysis by source code"
+    source_codes:
+      'B': "Branch"
+      'A': "ATM"
+      'I': "Internet/Online"
+      'M': "Mobile"
+      'P': "Phone"
+      'E': "Electronic/ACH"
+      'T': "Teller"
+    query: |
+      SELECT 
+          CASE st.SOURCECODE
+              WHEN 'B' THEN 'Branch'
+              WHEN 'A' THEN 'ATM'
+              WHEN 'I' THEN 'Online Banking'
+              WHEN 'M' THEN 'Mobile'
+              WHEN 'P' THEN 'Phone'
+              WHEN 'E' THEN 'Electronic'
+              WHEN 'T' THEN 'Teller'
+              ELSE 'Other'
+          END as Channel,
+          COUNT(*) as TransactionCount,
+          COUNT(DISTINCT st.PARENTACCOUNT) as UniqueMembers,
+          SUM(ABS(st.BALANCECHANGE)) as TotalAmount
+      FROM SAVINGSTRANSACTION st
+      WHERE st.EFFECTIVEDATE >= DATEADD(MONTH, -12, GETDATE())
+      GROUP BY st.SOURCECODE
+      ORDER BY TransactionCount DESC
+
+  digital_engagement_indicators:
+    description: "Identify digital engagement indicators"
+    query: |
+      SELECT 
+          a.ACCOUNTNUMBER,
+          -- Card Usage Indicator
+          CASE WHEN EXISTS (
+              SELECT 1 FROM CARD c 
+              WHERE c.PARENTACCOUNT = a.ACCOUNTNUMBER 
+              AND c.STATUS = 1
+              AND c.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+          ) THEN 1 ELSE 0 END as HasActiveCard,
+          
+          -- Online/Mobile Transaction Indicator
+          CASE WHEN EXISTS (
+              SELECT 1 FROM SAVINGSTRANSACTION st 
+              WHERE st.PARENTACCOUNT = a.ACCOUNTNUMBER 
+              AND st.SOURCECODE IN ('I', 'M')
+              AND st.EFFECTIVEDATE >= DATEADD(MONTH, -6, GETDATE())
+          ) THEN 1 ELSE 0 END as HasDigitalTransactions,
+          
+          -- EFT Setup Indicator  
+          CASE WHEN EXISTS (
+              SELECT 1 FROM EFT e 
+              WHERE e.PARENTACCOUNT = a.ACCOUNTNUMBER 
+              AND e.STATUS = 'A'
+          ) THEN 1 ELSE 0 END as HasActiveEFT,
+          
+          -- ATM Usage Indicator
+          CASE WHEN EXISTS (
+              SELECT 1 FROM SAVINGSTRANSACTION st 
+              WHERE st.PARENTACCOUNT = a.ACCOUNTNUMBER 
+              AND st.SOURCECODE = 'A'
+              AND st.EFFECTIVEDATE >= DATEADD(MONTH, -3, GETDATE())
+          ) THEN 1 ELSE 0 END as HasATMUsage
+          
+      FROM ACCOUNT a
+      WHERE (a.CLOSEDATE IS NULL OR a.CLOSEDATE = '1900-01-01')
+      AND a.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+
+# DIGITAL ENGAGEMENT SCORING COMPONENTS
+# ====================================
+# Multi-factor engagement scoring system
+
+digital_engagement_scoring:
+  
+  engagement_score_calculation:
+    description: "Multi-factor engagement scoring (0-100 scale)"
+    components:
+      product_diversity_score:
+        weight: 25
+        description: "Product diversity (25%)"
+        calculation: "(COUNT(DISTINCT s.ID) + COUNT(DISTINCT l.ID)) * 12.5"
+        
+      balance_relationship_score:
+        weight: 15
+        description: "Balance relationship (15%)"
+        tiers:
+          - threshold: 100000
+            score: 15
+          - threshold: 50000
+            score: 12
+          - threshold: 25000
+            score: 9
+          - threshold: 10000
+            score: 6
+          - default: 3
+            
+      tenure_score:
+        weight: 10
+        description: "Member tenure (10%)"
+        tiers:
+          - years: 20
+            score: 10
+          - years: 10
+            score: 8
+          - years: 5
+            score: 5
+          - default: 2
+            
+      digital_adoption_score:
+        weight: 20
+        description: "Digital adoption (20%)"
+        components:
+          card_adoption: 10
+          eft_enrollment: 10
+          
+      transaction_frequency_score:
+        weight: 20
+        description: "Transaction activity (20%)"
+        calculation: "Based on transaction count in last 12 months"
+        
+      channel_diversity_score:
+        weight: 10
+        description: "Channel usage diversity (10%)"
+        calculation: "Number of different channels used"
+    
+    complete_scoring_query: |
+      SELECT 
+          a.ACCOUNTNUMBER,
+          n.FIRST + ' ' + n.LAST as MemberName,
+          
+          -- Product Diversity Score (25%)
+          (COUNT(DISTINCT s.ID) + COUNT(DISTINCT l.ID)) * 12.5 as ProductScore,
+          
+          -- Balance Relationship Score (15%)
+          CASE 
+              WHEN SUM(ISNULL(s.BALANCE, 0)) > 100000 THEN 15
+              WHEN SUM(ISNULL(s.BALANCE, 0)) > 50000 THEN 12
+              WHEN SUM(ISNULL(s.BALANCE, 0)) > 25000 THEN 9
+              WHEN SUM(ISNULL(s.BALANCE, 0)) > 10000 THEN 6
+              ELSE 3
+          END as BalanceScore,
+          
+          -- Tenure Score (10%)
+          CASE 
+              WHEN DATEDIFF(YEAR, a.OPENDATE, GETDATE()) > 20 THEN 10
+              WHEN DATEDIFF(YEAR, a.OPENDATE, GETDATE()) > 10 THEN 8
+              WHEN DATEDIFF(YEAR, a.OPENDATE, GETDATE()) > 5 THEN 5
+              ELSE 2
+          END as TenureScore,
+          
+          -- Digital Adoption Score (20%)
+          (CASE WHEN card_data.CARDCOUNT > 0 THEN 10 ELSE 0 END +
+           CASE WHEN eft_data.EFTCOUNT > 0 THEN 10 ELSE 0 END) as DigitalScore,
+          
+          -- Combined Engagement Score
+          ((COUNT(DISTINCT s.ID) + COUNT(DISTINCT l.ID)) * 12.5 +
+           CASE 
+               WHEN SUM(ISNULL(s.BALANCE, 0)) > 100000 THEN 15
+               WHEN SUM(ISNULL(s.BALANCE, 0)) > 50000 THEN 12
+               WHEN SUM(ISNULL(s.BALANCE, 0)) > 25000 THEN 9
+               WHEN SUM(ISNULL(s.BALANCE, 0)) > 10000 THEN 6
+               ELSE 3
+           END +
+           CASE 
+               WHEN DATEDIFF(YEAR, a.OPENDATE, GETDATE()) > 20 THEN 10
+               WHEN DATEDIFF(YEAR, a.OPENDATE, GETDATE()) > 10 THEN 8
+               WHEN DATEDIFF(YEAR, a.OPENDATE, GETDATE()) > 5 THEN 5
+               ELSE 2
+           END +
+           (CASE WHEN card_data.CARDCOUNT > 0 THEN 10 ELSE 0 END +
+            CASE WHEN eft_data.EFTCOUNT > 0 THEN 10 ELSE 0 END)) as TotalEngagementScore
+            
+      FROM ACCOUNT a
+      INNER JOIN NAME n ON a.ACCOUNTNUMBER = n.PARENTACCOUNT AND n.TYPE = 0 AND n.ORDINAL = 0
+      LEFT JOIN SAVINGS s ON a.ACCOUNTNUMBER = s.PARENTACCOUNT
+          AND (s.CLOSEDATE IS NULL OR s.CLOSEDATE = '1900-01-01')
+          AND s.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      LEFT JOIN LOAN l ON a.ACCOUNTNUMBER = l.PARENTACCOUNT
+          AND (l.CLOSEDATE IS NULL OR l.CLOSEDATE = '1900-01-01')
+          AND (l.CHARGEOFFDATE IS NULL OR l.CHARGEOFFDATE = '1900-01-01')
+          AND l.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      LEFT JOIN (
+          SELECT PARENTACCOUNT, COUNT(*) as CARDCOUNT
+          FROM CARD 
+          WHERE STATUS = 1
+          AND ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+          GROUP BY PARENTACCOUNT
+      ) card_data ON a.ACCOUNTNUMBER = card_data.PARENTACCOUNT
+      LEFT JOIN (
+          SELECT PARENTACCOUNT, COUNT(*) as EFTCOUNT
+          FROM EFT 
+          WHERE STATUS = 'A'
+          GROUP BY PARENTACCOUNT
+      ) eft_data ON a.ACCOUNTNUMBER = eft_data.PARENTACCOUNT
+      WHERE (a.CLOSEDATE IS NULL OR a.CLOSEDATE = '1900-01-01')
+      AND a.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      AND n.ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')
+      GROUP BY a.ACCOUNTNUMBER, n.FIRST, n.LAST, a.OPENDATE, 
+               card_data.CARDCOUNT, eft_data.EFTCOUNT
+
+# QUERY OPTIMIZATION SETTINGS
+# ==========================
+# Performance and reliability improvements
+
+query_optimization:
+  max_transaction_days: 365      # Limit transaction queries to last year
+  use_nolock: true              # For read-only queries
+  chunk_size: 10000             # For large result sets
+  timeout_seconds: 30           # Query timeout
+  max_cte_depth: 3              # Reduced from 5 for MCP compatibility
+  enable_parallel_execution: false  # Disable for MCP compatibility
+  
+# STANDARD FILTERS
+# ===============
+# Common filter patterns for consistency
+
+standard_filters:
+  active_account: "(CLOSEDATE IS NULL OR CLOSEDATE = '1900-01-01')"
+  current_process_date: "ProcessDate = FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+  primary_name: "ORDINAL = 0 AND TYPE = 0"
+  active_card_status: "STATUS = 1"
+  active_loan: "((CLOSEDATE IS NULL OR CLOSEDATE = '1900-01-01') AND (CHARGEOFFDATE IS NULL OR CHARGEOFFDATE = '1900-01-01'))"
+  active_savings: "(CLOSEDATE IS NULL OR CLOSEDATE = '1900-01-01')"
+  valid_ssn: "SSN IS NOT NULL AND SSN <> ''"
+
+# CHANNEL MAPPINGS
+# ===============
+# Transaction source code mappings
+
+channel_codes:
+  B: "Branch"
+  A: "ATM"
+  I: "Online Banking"
+  M: "Mobile"
+  P: "Phone"
+  E: "Electronic/ACH"
+  T: "Teller"
+  O: "Other"
+
+# TRANSACTION WEIGHTS
+# ==================
+# Channel priorities for engagement scoring
+
+transaction_weights:
+  mobile: 1.5        # Higher weight for digital channels
+  online: 1.3
+  electronic: 1.2
+  atm: 1.0
+  phone: 0.8
+  branch: 0.6
+  teller: 0.6
+  other: 0.5
+
+# IMMEDIATE FIXES IMPLEMENTATION
+# =============================
+# Critical corrections based on analysis
+
+immediate_fixes:
+  use_name_table_for_demographics:
+    description: "Use NAME table instead of MEMBERREC for demographic queries"
+    implementation: "All demographic queries should join via NAME.PARENTACCOUNT = ACCOUNT.ACCOUNTNUMBER"
+    
+  handle_missing_processdate_in_transactions:
+    description: "Transaction tables don't have ProcessDate - use date ranges instead"
+    solution: "Use EFFECTIVEDATE, POSTDATE, or ACTIVITYDATE with date range filters"
+    example: "WHERE EFFECTIVEDATE >= DATEADD(MONTH, -12, GETDATE())"
+    
+  create_transaction_aggregates:
+    description: "Pre-aggregate transaction data for performance"
+    recommendation: "Create materialized views or summary tables for common transaction metrics"
+    
+  add_index_recommendations:
+    description: "Database index recommendations for MCP queries"
+    indexes:
+      - "CREATE INDEX IX_NAME_PARENTACCOUNT_TYPE ON NAME (PARENTACCOUNT, TYPE, ORDINAL)"
+      - "CREATE INDEX IX_SAVINGS_PARENTACCOUNT_CLOSEDATE ON SAVINGS (PARENTACCOUNT, CLOSEDATE, ProcessDate)"
+      - "CREATE INDEX IX_LOAN_PARENTACCOUNT_STATUS ON LOAN (PARENTACCOUNT, CLOSEDATE, CHARGEOFFDATE, ProcessDate)"
+      - "CREATE INDEX IX_SAVINGSTRANSACTION_EFFECTIVEDATE ON SAVINGSTRANSACTION (EFFECTIVEDATE, SOURCECODE)"
+      
+  implement_result_caching:
+    description: "Cache frequently accessed data"
+    cache_duration_minutes: 60
+    cached_queries:
+      - "Active member counts"
+      - "Financial summaries" 
+      - "Channel usage statistics"
+      - "Engagement scores"
+
+# TRANSACTION & DIGITAL ENGAGEMENT METRICS
+# ========================================
+# Available metrics despite relationship issues
+
+available_metrics:
+  channel_usage:
+    source: "SOURCECODE in SAVINGSTRANSACTION and LOANTRANSACTION"
+    metrics: ["Transaction count by channel", "Volume by channel", "Unique users by channel"]
+    
+  card_adoption:
+    source: "CARD table STATUS field"
+    metrics: ["Active card count", "Card adoption rate", "Card usage by type"]
+    
+  eft_enrollment:
+    source: "EFT table"
+    metrics: ["EFT setup rate", "Active EFT count", "EFT usage patterns"]
+    
+  online_banking_indicators:
+    source: "CARDACCESS table and transaction source codes"
+    metrics: ["Online banking adoption", "Digital transaction frequency"]
+    
+  mobile_adoption:
+    source: "Transaction SOURCECODE = 'M'"
+    metrics: ["Mobile transaction volume", "Mobile user count", "Mobile usage trends"]
+    
+  atm_usage:
+    source: "Transaction SOURCECODE = 'A'"
+    metrics: ["ATM transaction frequency", "ATM user patterns", "ATM location analysis"]
+
+# VALIDATION RESULTS TRACKING
 validation_status:
   last_validated: "2025-09-24"
   critical_fixes_applied:
@@ -888,25 +1326,66 @@ validation_status:
     - "CHARGEOFFDATE business rule corrected to NULL"
     - "Field names corrected (ID -> PARENTID, MBRSTATUS, MBRCREATEDATE)"
     - "Data type casting requirements added"
-    - "ProcessDate filter requirements added"  # NEW
-    - "Magnitude validation rules implemented"  # NEW
-    - "Active member definition standardized"  # NEW
-    - "MCP-compatible query templates added"  # NEW
-    - "Column reference fixes applied (AccountNumber -> ACCOUNTNUMBER)"  # NEW
-    - "Simplified queries replacing complex specialized functions"  # NEW
+    - "ProcessDate filter requirements added"
+    - "Magnitude validation rules implemented"
+    - "Active member definition standardized"
+    - "MCP-compatible query templates added"
+    - "Column reference fixes applied (AccountNumber -> ACCOUNTNUMBER)"
+    - "Simplified queries replacing complex specialized functions"
+    - "Enhanced table relationship mappings implemented"  # NEW
+    - "Helper query patterns for common operations added"  # NEW
+    - "Transaction analysis patterns with channel mapping added"  # NEW
+    - "Digital engagement scoring components implemented"  # NEW
+    - "Query optimization settings configured"  # NEW
+    - "Standard filters and channel codes defined"  # NEW
+    - "Immediate fixes for MEMBERREC vs NAME table issues applied"  # NEW
   
   pending_validations:
     - "Transaction code mappings verification"
     - "Card status active values confirmation"
     - "Performance optimization testing"
     - "Fee capture process review"
+    - "Digital engagement scoring validation"  # NEW
+    - "Channel mapping accuracy verification"  # NEW
   
   known_issues_resolved:
-    - "ProcessDate filter prevents historical aggregation"  # NEW
-    - "Member count now shows ~57.6K instead of 117K"  # NEW
-    - "Loan balance shows ~$351M instead of $53.9B"  # NEW
+    - "ProcessDate filter prevents historical aggregation"
+    - "Member count now shows ~57.6K instead of 117K"
+    - "Loan balance shows ~$351M instead of $53.9B"
     - "Active record queries now return correct counts"
     - "Profitability calculations use proper joins"
     - "Cross-database relationships properly mapped"
-    - "MCP SQL restriction errors eliminated"  # NEW
-    - "Specialized function dependency removed"  # NEW
+    - "MCP SQL restriction errors eliminated"
+    - "Specialized function dependency removed"
+    - "MEMBERREC vs NAME table relationship clarified"  # NEW
+    - "Transaction table ProcessDate missing field handled"  # NEW
+    - "Column name inconsistencies addressed"  # NEW
+    - "Query performance timeout issues mitigated"  # NEW
+
+# EFFECTIVENESS IMPROVEMENTS SUMMARY
+# ==================================
+# How these changes improve MCP effectiveness
+
+effectiveness_improvements:
+  accurate_relationships:
+    - "Use NAME table for demographics instead of incompatible MEMBERREC joins"
+    - "Proper table relationship mappings prevent join failures"
+    - "Standardized helper patterns reduce query errors"
+    
+  performance_optimization:
+    - "Query timeout settings prevent hanging queries"
+    - "Transaction date range limits prevent performance issues"
+    - "Index recommendations improve query speed"
+    - "Result caching reduces redundant processing"
+    
+  digital_engagement_tracking:
+    - "Channel analysis via SOURCECODE enables digital adoption metrics"
+    - "Multi-factor engagement scoring provides member insights"
+    - "Card, EFT, and online banking adoption tracking"
+    - "Mobile and ATM usage pattern analysis"
+    
+  error_prevention:
+    - "Standard filters prevent common query mistakes"
+    - "Immediate fixes address known relationship issues"
+    - "MCP-compatible patterns avoid SQL restriction errors"
+    - "Data validation rules catch magnitude anomalies"
