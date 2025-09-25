@@ -10,14 +10,16 @@ CRITICAL: All queries MUST include ProcessDate filter to avoid historical aggreg
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import pandas as pd
-from loguru import logger
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class QueryBuilder:
     """
     Builder class for constructing common SQL queries with proper parameterization.
     
-    CRITICAL: All queries include mandatory ProcessDate filtering.
+    CRITICAL: All queries include mandatory ProcessDate filtering using definitive logic.
     """
     
     def __init__(self, database_type: str = "ARCUSYM000"):
@@ -29,6 +31,42 @@ class QueryBuilder:
         """
         self.database_type = database_type
         self.ensure_process_date_filter = True  # Mandatory ProcessDate filtering
+        
+        # Definitive process date formula from Power BI query
+        self.process_date_formula = "FORMAT(DATEADD(DAY, -1, GETDATE()), 'yyyyMMdd')"
+        
+        # Account type mappings from definitive query
+        self.account_type_mappings = {
+            0: "General Membership",
+            1: "Share Draft",
+            2: "Money Market", 
+            5: "Certificate",
+            6: "IRA",
+            8: "Minor",
+            9: "Representative Payee",
+            10: "Club",
+            11: "TUTMA",
+            12: "Benefit",
+            13: "Indirect",
+            15: "Guardianship",
+            87: "Professional Association",
+            88: "Sole Proprietorship-Individual",
+            89: "Trust",
+            90: "C Corporation",
+            91: "S Corporation",
+            92: "Sole Proprietorship-Non-Individual",
+            93: "Limited Liability Co (LLC)",
+            94: "General Partnership",
+            95: "Limited Partnership",
+            96: "Limited Liability Partnership",
+            97: "Non Profit Org/Assoc/Club",
+            98: "Non Profit Corporation",
+            99: "Estate"
+        }
+        
+        # Allowed account types from definitive query
+        self.allowed_account_types = [0, 1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 15, 
+                                     87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
         
     def build_member_query(self, as_of_date: Optional[str] = None, 
                           include_inactive: bool = False,
@@ -207,22 +245,19 @@ class QueryBuilder:
         Returns:
             Corrected profitability query with ProcessDate filter
         """
-        base_query = """
-        WITH CurrentSnapshot AS (
-            SELECT MAX(ProcessDate) as CurrentDate FROM NAME
-        ),
-        ActiveMembers AS (
+        base_query = f"""
+        WITH ActiveMembers AS (
             SELECT DISTINCT
                 n.PARENTACCOUNT as MemberNumber,
                 n.FIRST, n.LAST,
                 n.MBRSTATUS,
                 n.MBRCREATEDATE
             FROM NAME n
-            CROSS JOIN CurrentSnapshot cs
-            WHERE n.ProcessDate = cs.CurrentDate
+            WHERE n.ProcessDate = {self.process_date_formula}
                 AND n.TYPE = 0  -- Primary name
                 AND n.MBRSTATUS = 0  -- Active
                 AND CAST(n.PARENTACCOUNT AS BIGINT) > 100  -- Exclude test
+                AND n.SSN IS NOT NULL AND n.SSN <> ''  -- Valid SSN required
         ),
         LoanIncome AS (
             SELECT 
@@ -232,10 +267,9 @@ class QueryBuilder:
                 COUNT(l.ID) as LoanCount,
                 SUM(l.BALANCE) as TotalLoanBalance
             FROM LOAN l
-            CROSS JOIN CurrentSnapshot cs
-            WHERE l.ProcessDate = cs.CurrentDate
-                AND l.CLOSEDATE IS NULL
-                AND l.CHARGEOFFDATE IS NULL
+            WHERE l.ProcessDate = {self.process_date_formula}
+                AND (l.CLOSEDATE IS NULL OR l.CLOSEDATE = '1900-01-01')
+                AND (l.CHARGEOFFDATE IS NULL OR l.CHARGEOFFDATE = '1900-01-01')
                 AND CAST(l.PARENTACCOUNT AS BIGINT) > 100
             GROUP BY l.PARENTACCOUNT
         ),
@@ -245,16 +279,15 @@ class QueryBuilder:
                 SUM(s.BALANCE) as TotalSavingsBalance,
                 COUNT(s.ID) as SavingsCount
             FROM SAVINGS s
-            CROSS JOIN CurrentSnapshot cs
-            WHERE s.ProcessDate = cs.CurrentDate
-                AND s.CLOSEDATE IS NULL
+            WHERE s.ProcessDate = {self.process_date_formula}
+                AND (s.CLOSEDATE IS NULL OR s.CLOSEDATE = '1900-01-01')
                 AND CAST(s.PARENTACCOUNT AS BIGINT) > 100
             GROUP BY s.PARENTACCOUNT
         )
         """
         
         if include_fees:
-            base_query += """
+            base_query += f"""
         ,
         FeeIncome AS (
             SELECT 
@@ -266,8 +299,7 @@ class QueryBuilder:
             FROM LOANTRANSACTION lt
             INNER JOIN LOAN l ON lt.PARENTACCOUNT = l.PARENTACCOUNT 
                 AND lt.PARENTID = l.ID  -- Corrected: Use PARENTID not ID
-            CROSS JOIN CurrentSnapshot cs
-            WHERE l.ProcessDate = cs.CurrentDate
+            WHERE l.ProcessDate = {self.process_date_formula}
                 AND lt.PostDate >= DATEADD(year, -1, GETDATE())
                 AND CAST(lt.PARENTACCOUNT AS BIGINT) > 100
             GROUP BY lt.PARENTACCOUNT
@@ -365,6 +397,209 @@ class QueryBuilder:
         
         return query
     
+    def build_definitive_active_member_count_query(self) -> str:
+        """
+        Build the definitive active member count query from Power BI.
+        
+        This is the EXACT query logic used in production reporting.
+        
+        Returns:
+            SQL query string implementing definitive active member logic
+        """
+        # Generate account type CASE statements
+        account_type_cases = []
+        for type_code, description in self.account_type_mappings.items():
+            account_type_cases.append(f"        WHEN {type_code} THEN '{description}'")
+        
+        account_type_case_statement = "\n".join(account_type_cases)
+        
+        # Generate formatted account type CASE statements  
+        formatted_type_cases = []
+        for type_code, description in self.account_type_mappings.items():
+            formatted_type_cases.append(f"        WHEN {type_code} THEN '{description}'")
+        
+        formatted_type_case_statement = "\n".join(formatted_type_cases)
+        
+        # Convert allowed types to comma-separated string
+        allowed_types_str = ", ".join(map(str, self.allowed_account_types))
+        
+        return f"""
+-- Power BI SQL Query for Account Type Report (No CTEs)
+-- Simple query structure compatible with Power BI - DEFINITIVE LOGIC
+
+SELECT 
+    {self.process_date_formula} as ProcessDate,
+    ActiveMembers.AccountType,
+    CASE ActiveMembers.AccountType
+{account_type_case_statement}
+        ELSE 'Unknown'
+    END as AccountTypeDescription,
+    ActiveMembers.LAST as MemberName,
+    ActiveMembers.AccountNumber,
+    ActiveMembers.SSN,
+    ActiveMembers.Branch,
+    'Type ' + RIGHT('0000' + CAST(ActiveMembers.AccountType as VARCHAR), 4) + '-' + 
+    CASE ActiveMembers.AccountType
+{formatted_type_case_statement}
+        ELSE 'Unknown'
+    END as FormattedAccountType,
+    1 as MemberCount
+FROM (
+    SELECT DISTINCT 
+        n.SSN,
+        n.LAST,
+        n.MemberNumber,
+        FIRST_VALUE(a.AccountNumber) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as AccountNumber,
+        FIRST_VALUE(a.TYPE) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as AccountType,
+        FIRST_VALUE(a.Branch) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as Branch,
+        ROW_NUMBER() OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as rn
+    FROM Name n
+    INNER JOIN Account a ON n.PARENTACCOUNT = a.ACCOUNTNUMBER
+    WHERE n.TYPE = 0
+        AND n.SSN IS NOT NULL 
+        AND n.SSN <> ''
+        AND n.ProcessDate = {self.process_date_formula}
+        AND a.ProcessDate = {self.process_date_formula}
+        AND a.TYPE IN ({allowed_types_str})
+        AND (a.CloseDate IS NULL OR a.CloseDate = '1900-01-01')
+        AND (
+            EXISTS (
+                SELECT 1 FROM Loan l 
+                WHERE l.PARENTACCOUNT = a.AccountNumber 
+                    AND l.ProcessDate = {self.process_date_formula}
+                    AND (l.ChargeOffDate IS NULL OR l.ChargeOffDate = '1900-01-01')
+                    AND (l.CloseDate IS NULL OR l.CloseDate = '1900-01-01')
+            )
+            OR 
+            EXISTS (
+                SELECT 1 FROM SAVINGS s 
+                WHERE s.PARENTACCOUNT = a.AccountNumber 
+                    AND s.ProcessDate = {self.process_date_formula}
+                    AND (s.ChargeOffDate IS NULL OR s.ChargeOffDate = '1900-01-01')
+                    AND (s.CloseDate IS NULL OR s.CloseDate = '1900-01-01')
+            )
+        )
+) ActiveMembers
+WHERE ActiveMembers.rn = 1
+"""
+    
+    def build_active_member_summary_query(self) -> str:
+        """
+        Build simplified active member summary using definitive logic.
+        
+        Returns:
+            SQL query for member count summary
+        """
+        allowed_types_str = ", ".join(map(str, self.allowed_account_types))
+        
+        return f"""
+-- Active Member Count Summary - Definitive Logic
+SELECT 
+    COUNT(DISTINCT ActiveMembers.SSN) as ActiveMemberCount,
+    COUNT(DISTINCT ActiveMembers.AccountNumber) as TotalActiveAccounts,
+    {self.process_date_formula} as ProcessDate,
+    'Definitive Active Member Logic Applied' as QueryType
+FROM (
+    SELECT DISTINCT 
+        n.SSN,
+        n.LAST,
+        FIRST_VALUE(a.AccountNumber) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as AccountNumber,
+        FIRST_VALUE(a.TYPE) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as AccountType,
+        ROW_NUMBER() OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as rn
+    FROM Name n
+    INNER JOIN Account a ON n.PARENTACCOUNT = a.ACCOUNTNUMBER
+    WHERE n.TYPE = 0
+        AND n.SSN IS NOT NULL 
+        AND n.SSN <> ''
+        AND n.ProcessDate = {self.process_date_formula}
+        AND a.ProcessDate = {self.process_date_formula}
+        AND a.TYPE IN ({allowed_types_str})
+        AND (a.CloseDate IS NULL OR a.CloseDate = '1900-01-01')
+        AND (
+            EXISTS (
+                SELECT 1 FROM Loan l 
+                WHERE l.PARENTACCOUNT = a.AccountNumber 
+                    AND l.ProcessDate = {self.process_date_formula}
+                    AND (l.ChargeOffDate IS NULL OR l.ChargeOffDate = '1900-01-01')
+                    AND (l.CloseDate IS NULL OR l.CloseDate = '1900-01-01')
+            )
+            OR 
+            EXISTS (
+                SELECT 1 FROM SAVINGS s 
+                WHERE s.PARENTACCOUNT = a.AccountNumber 
+                    AND s.ProcessDate = {self.process_date_formula}
+                    AND (s.ChargeOffDate IS NULL OR s.ChargeOffDate = '1900-01-01')
+                    AND (s.CloseDate IS NULL or s.CloseDate = '1900-01-01')
+            )
+        )
+) ActiveMembers
+WHERE ActiveMembers.rn = 1
+"""
+    
+    def build_member_breakdown_by_account_type_query(self) -> str:
+        """
+        Build member breakdown by account type using definitive logic.
+        
+        Returns:
+            SQL query for member breakdown by account type
+        """
+        # Generate account type CASE statement
+        account_type_cases = []
+        for type_code, description in self.account_type_mappings.items():
+            account_type_cases.append(f"        WHEN {type_code} THEN '{description}'")
+        
+        account_type_case_statement = "\n".join(account_type_cases)
+        allowed_types_str = ", ".join(map(str, self.allowed_account_types))
+        
+        return f"""
+-- Member Breakdown by Account Type - Definitive Logic
+SELECT 
+    ActiveMembers.AccountType,
+    CASE ActiveMembers.AccountType
+{account_type_case_statement}
+        ELSE 'Unknown'
+    END as AccountTypeDescription,
+    COUNT(DISTINCT ActiveMembers.SSN) as MemberCount,
+    COUNT(DISTINCT ActiveMembers.AccountNumber) as AccountCount,
+    {self.process_date_formula} as ProcessDate
+FROM (
+    SELECT DISTINCT 
+        n.SSN,
+        FIRST_VALUE(a.AccountNumber) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as AccountNumber,
+        FIRST_VALUE(a.TYPE) OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as AccountType,
+        ROW_NUMBER() OVER (PARTITION BY n.SSN ORDER BY a.OpenDate ASC) as rn
+    FROM Name n
+    INNER JOIN Account a ON n.PARENTACCOUNT = a.ACCOUNTNUMBER
+    WHERE n.TYPE = 0
+        AND n.SSN IS NOT NULL 
+        AND n.SSN <> ''
+        AND n.ProcessDate = {self.process_date_formula}
+        AND a.ProcessDate = {self.process_date_formula}
+        AND a.TYPE IN ({allowed_types_str})
+        AND (a.CloseDate IS NULL OR a.CloseDate = '1900-01-01')
+        AND (
+            EXISTS (
+                SELECT 1 FROM Loan l 
+                WHERE l.PARENTACCOUNT = a.AccountNumber 
+                    AND l.ProcessDate = {self.process_date_formula}
+                    AND (l.ChargeOffDate IS NULL OR l.ChargeOffDate = '1900-01-01')
+                    AND (l.CloseDate IS NULL OR l.CloseDate = '1900-01-01')
+            )
+            OR 
+            EXISTS (
+                SELECT 1 FROM SAVINGS s 
+                WHERE s.PARENTACCOUNT = a.AccountNumber 
+                    AND s.ProcessDate = {self.process_date_formula}
+                    AND (s.ChargeOffDate IS NULL OR s.ChargeOffDate = '1900-01-01')
+                    AND (s.CloseDate IS NULL OR s.CloseDate = '1900-01-01')
+            )
+        )
+) ActiveMembers
+WHERE ActiveMembers.rn = 1
+GROUP BY ActiveMembers.AccountType
+ORDER BY MemberCount DESC
+"""
+
     def build_financial_summary_query(self, as_of_date: Optional[str] = None) -> str:
         """
         Build financial summary query for institution-level metrics.
